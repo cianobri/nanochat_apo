@@ -1,18 +1,40 @@
 TEST_RUN
 
---depth=4   
---aspect-ratio=64   
---head-dim=64   
---window-pattern=L   
---max-seq-len=512   
---device-batch-size=8   
---total-batch-size=8192   
---eval-every=100   
---eval-tokens=65536   
---core-metric-every=-1   
---sample-every=-1   
---save-every=-1   
---num-iterations=500   
---run=dummy   
---model-tag=d4_sanity 
+python -m scripts.base_train.py \
+--depth=4    \
+--aspect-ratio=64    \
+--head-dim=64   \
+--window-pattern=L   \
+--max-seq-len=512   \
+--device-batch-size=8   \
+--total-batch-size=8192   \
+--eval-every=100   \
+--eval-tokens=65536   \
+--core-metric-every=-1   \
+--sample-every=-1   \
+--save-every=-1   \
+--num-iterations=1500   \
+--run=dummy   \
+--model-tag=d4_sanity \
+--ns-steps=5 \
 | tee logs/test_log.log
+
+
+
+
+tmux new -s train
+Ctrl-b then d
+tmux attach -t train
+tmux ls
+tmux kill-session -t train
+
+
+python -m scripts.base_train.py \
+--core-metric-every=-1   \
+--sample-every=-1   \
+--save-every=-1   \
+--num-iterations=10000   \
+--run=dummy   \
+--model-tag=muonPolarExpress \
+--ns-iter=2 \
+| tee logs/muonPolarExpress.log
