@@ -63,6 +63,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--ns-steps", type=int, default=5, help="number of Newton-Schulz/Polar Express iterations for Muon")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -313,6 +314,7 @@ optimizer = model.setup_optimizer(
     scalar_lr=args.scalar_lr * batch_lr_scale,
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
+    ns_steps=args.ns_steps,
     weight_decay=weight_decay_scaled,
 )
 
