@@ -371,7 +371,14 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express"):
+        if muon_orthogonalization not in {"polar_express", "newton_schulz"}:
+            raise ValueError(f"Unknown Muon orthogonalization method: {muon_orthogonalization}")
+        if ns_steps < 1:
+            raise ValueError("ns_steps must be at least 1")
+        if muon_orthogonalization == "polar_express" and ns_steps > 5:
+            raise ValueError("ns_steps must be at most 5 for polar_express")
+
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -404,7 +411,8 @@ class GPT(nn.Module):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=ns_steps, beta2=0.9, weight_decay=weight_decay,
+                momentum=0.95, ns_steps=ns_steps, orthogonalization=muon_orthogonalization,
+                beta2=0.9, weight_decay=weight_decay,
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW

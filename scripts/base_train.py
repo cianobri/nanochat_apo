@@ -65,6 +65,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--ns-steps", "--ns_steps", type=int, default=5, help="number of Newton-Schulz/Polar Express iterations for Muon")
+parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz"], help="orthogonalization method for Muon updates")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -80,8 +81,10 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
-if not 1 <= args.ns_steps <= 5:
-    parser.error("--ns-steps must be between 1 and 5")
+if args.ns_steps < 1:
+    parser.error("--ns-steps must be at least 1")
+if args.muon_orthogonalization == "polar_express" and args.ns_steps > 5:
+    parser.error("--ns-steps must be between 1 and 5 for polar_express")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -318,6 +321,7 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     ns_steps=args.ns_steps,
+    muon_orthogonalization=args.muon_orthogonalization,
     weight_decay=weight_decay_scaled,
 )
 

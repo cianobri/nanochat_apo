@@ -75,7 +75,40 @@ polar_express_coeffs = [
 ]
 
 
-def muon_step_fused(
+def _finish_muon_step(
+    g: Tensor,
+    stacked_params: Tensor,
+    second_momentum_buffer: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    red_dim: int,
+) -> None:
+    # Variance reduction
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + parameter update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+def muon_step_polar_express_fused(
     stacked_grads: Tensor,
     stacked_params: Tensor,
     momentum_buffer: Tensor,
@@ -115,30 +148,56 @@ def muon_step_fused(
             B = b * A + c * (A @ A)
             X = a * X + B @ X
 
-    g = X
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
 
-    # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
 
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
+def muon_step_newton_schulz_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> Newton-Schulz -> variance_reduction -> cautious_update.
 
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    This function may be wrapped with torch.compile below unless
+    NANOCHAT_DISABLE_COMPILE=1 is set.
+    """
 
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
+    # Newton-Schulz iteration for the zeroth power / orthogonalized update.
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
 
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    if g.size(-2) > g.size(-1):  # Tall matrix
+        for _ in range(ns_steps):
+            A = X.mT @ X
+            X = 1.5 * X - 0.5 * (X @ A)
+    else:  # Wide matrix
+        for _ in range(ns_steps):
+            A = X @ X.mT
+            X = 1.5 * X - 0.5 * (A @ X)
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+
+
+def _get_muon_step_fn(group: dict):
+    orthogonalization = group.get("orthogonalization", "polar_express")
+    if orthogonalization == "polar_express":
+        return muon_step_polar_express_fused
+    if orthogonalization == "newton_schulz":
+        return muon_step_newton_schulz_fused
+    raise ValueError(f"Unknown Muon orthogonalization method: {orthogonalization}")
 
 
 # -----------------------------------------------------------------------------
@@ -151,7 +210,8 @@ def muon_step_fused(
 
 if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
-    muon_step_fused = torch.compile(muon_step_fused, dynamic=False, fullgraph=True)
+    muon_step_polar_express_fused = torch.compile(muon_step_polar_express_fused, dynamic=False, fullgraph=True)
+    muon_step_newton_schulz_fused = torch.compile(muon_step_newton_schulz_fused, dynamic=False, fullgraph=True)
 
 
 # -----------------------------------------------------------------------------
@@ -167,7 +227,7 @@ class MuonAdamW(torch.optim.Optimizer):
             - 'params': List of parameters
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization', 'beta2', 'weight_decay'
     """
 
     def __init__(self, param_groups: list[dict]):
@@ -259,7 +319,8 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
-        muon_step_fused(
+        muon_step_fn = _get_muon_step_fn(group)
+        muon_step_fn(
             stacked_grads,
             stacked_params,
             momentum_buffer,
@@ -449,7 +510,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
 
-            muon_step_fused(
+            muon_step_fn = _get_muon_step_fn(group)
+            muon_step_fn(
                 grad_chunk[:num_owned],
                 stacked_owned,
                 state["momentum_buffer"][:num_owned],
