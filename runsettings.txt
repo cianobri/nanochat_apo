@@ -1,0 +1,18 @@
+TEST_RUN
+
+--depth=4   
+--aspect-ratio=64   
+--head-dim=64   
+--window-pattern=L   
+--max-seq-len=512   
+--device-batch-size=8   
+--total-batch-size=8192   
+--eval-every=100   
+--eval-tokens=65536   
+--core-metric-every=-1   
+--sample-every=-1   
+--save-every=-1   
+--num-iterations=500   
+--run=dummy   
+--model-tag=d4_sanity 
+| tee logs/test_log.log
