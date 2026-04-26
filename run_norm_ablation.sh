@@ -15,7 +15,7 @@ COMMON_ARGS=(
 )
 
 # Optional override:
-#   NUM_ITERATIONS=1000 ./run_norm_ablation.sh
+#   NUM_ITERATIONS=500 ./run_norm_ablation.sh
 if [[ -n "${NUM_ITERATIONS:-}" ]]; then
   COMMON_ARGS+=(--num-iterations="${NUM_ITERATIONS}")
 fi

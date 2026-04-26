@@ -3,7 +3,9 @@ set -euo pipefail
 
 mkdir -p logs
 
-COMMON_ARGS=()
+COMMON_ARGS=(
+  --muon-orthogonalization-dtype=bfloat16
+)
 
 if [[ -n "${NUM_ITERATIONS:-}" ]]; then
   COMMON_ARGS+=(--num-iterations="${NUM_ITERATIONS}")
@@ -38,7 +40,7 @@ run_method polar_express \
   --muon-orthogonalization=polar_express \
   --model-tag=polar_express \
   --ns-steps=5 \
-  --print-every=50
+  --print-every=1
 
 run_method newton_schulz_1 \
   --core-metric-every=-1 \
@@ -52,7 +54,7 @@ run_method newton_schulz_1 \
   --ortho-order=1 \
   --ns-steps=5 \
   --muon-norm-iters=1 \
-  --print-every=50
+  --print-every=1
 
 run_method newton_schulz_2 \
   --core-metric-every=-1 \
@@ -66,7 +68,7 @@ run_method newton_schulz_2 \
   --ortho-order=2 \
   --ns-steps=5 \
   --muon-norm-iters=1 \
-  --print-every=50
+  --print-every=1
 
 run_method adaptive_poly_1 \
   --core-metric-every=-1 \
@@ -79,8 +81,8 @@ run_method adaptive_poly_1 \
   --model-tag=adaptive_poly_1 \
   --ortho-order=1 \
   --ns-steps=5 \
-  --muon-norm-iters=0 \
-  --print-every=50
+  --muon-norm-iters=1 \
+  --print-every=1
 
 run_method adaptive_poly_2 \
   --core-metric-every=-1 \
@@ -93,8 +95,8 @@ run_method adaptive_poly_2 \
   --model-tag=adaptive_poly_2 \
   --ortho-order=2 \
   --ns-steps=5 \
-  --muon-norm-iters=0 \
-  --print-every=50
+  --muon-norm-iters=1 \
+  --print-every=1
 
 run_method adamW \
   --optimizer=adamw \
@@ -105,4 +107,4 @@ run_method adamW \
   --save-every=-1 \
   --run=dummy \
   --model-tag=adamW \
-  --print-every=50
+  --print-every=1
