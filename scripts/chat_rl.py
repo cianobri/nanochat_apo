@@ -53,7 +53,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learnin
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--optimizer", type=str, default="adamw_muon", choices=["adamw", "adamw_muon"], help="optimizer to use: AdamW only, or AdamW for non-matrix params plus Muon for matrix params")
 parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly"], help="orthogonalization method for Muon updates")
-parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=1, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (1=on, 0=off)")
+parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=1, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (1=normalize, 0=skip)")
 parser.add_argument("--ortho-order", "--ortho_order", type=int, default=1, choices=[1, 2], help="polynomial order for adaptive_poly Muon orthogonalization")
 parser.add_argument("--ortho-grid", "--ortho_grid", type=int, default=17, help="grid points for adaptive_poly beta solve")
 parser.add_argument("--ortho-newton", "--ortho_newton", type=int, default=2, help="Newton refinement steps for adaptive_poly beta solve")
