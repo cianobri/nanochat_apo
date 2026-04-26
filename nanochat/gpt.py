@@ -371,13 +371,16 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express"):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express", optimizer="adamw_muon"):
+        if optimizer not in {"adamw", "adamw_muon"}:
+            raise ValueError(f"Unknown optimizer: {optimizer}")
         if muon_orthogonalization not in {"polar_express", "newton_schulz"}:
             raise ValueError(f"Unknown Muon orthogonalization method: {muon_orthogonalization}")
-        if ns_steps < 1:
-            raise ValueError("ns_steps must be at least 1")
-        if muon_orthogonalization == "polar_express" and ns_steps > 5:
-            raise ValueError("ns_steps must be at most 5 for polar_express")
+        if optimizer == "adamw_muon":
+            if ns_steps < 1:
+                raise ValueError("ns_steps must be at least 1")
+            if muon_orthogonalization == "polar_express" and ns_steps > 5:
+                raise ValueError("ns_steps must be at most 5 for polar_express")
 
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -406,14 +409,17 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=ns_steps, orthogonalization=muon_orthogonalization,
-                beta2=0.9, weight_decay=weight_decay,
-            ))
+        if optimizer == "adamw":
+            param_groups.append(dict(kind='adamw', params=matrix_params, lr=matrix_lr, betas=(0.8, 0.96), eps=1e-10, weight_decay=weight_decay))
+        else:
+            # Muon groups (matrix params, grouped by shape for stacking)
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=ns_steps, orthogonalization=muon_orthogonalization,
+                    beta2=0.9, weight_decay=weight_decay,
+                ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)

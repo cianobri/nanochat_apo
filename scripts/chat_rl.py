@@ -51,6 +51,7 @@ parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = d
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--optimizer", type=str, default="adamw_muon", choices=["adamw", "adamw_muon"], help="optimizer to use: AdamW only, or AdamW for non-matrix params plus Muon for matrix params")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
 # Evaluation / checkpointing
@@ -198,6 +199,7 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
+    optimizer=args.optimizer,
     weight_decay=args.weight_decay,
 )
 
