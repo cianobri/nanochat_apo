@@ -251,22 +251,17 @@ def _quartic_minimizer_on_interval(
     safeguarded Newton steps on J'(beta).
     """
 
-    beta_grid = torch.linspace(lo, hi, n_grid, dtype=c0.dtype, device=c0.device)
-    beta_grid = beta_grid.reshape(*((1,) * c0.ndim), n_grid)
-
-    values = _eval_quartic(
-        c0.unsqueeze(-1),
-        c1.unsqueeze(-1),
-        c2.unsqueeze(-1),
-        c3.unsqueeze(-1),
-        c4.unsqueeze(-1),
-        beta_grid,
-    )
-    idx = values.argmin(dim=-1)
-
-    grid = beta_grid.expand(*c0.shape, n_grid)
     delta = (hi - lo) / float(n_grid - 1)
-    beta0 = grid.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+
+    beta0 = torch.full_like(c0, lo)
+    best_value = _eval_quartic(c0, c1, c2, c3, c4, beta0)
+    for i in range(1, n_grid):
+        candidate = torch.full_like(c0, lo + delta * i)
+        value = _eval_quartic(c0, c1, c2, c3, c4, candidate)
+        take_candidate = value < best_value
+        beta0 = torch.where(take_candidate, candidate, beta0)
+        best_value = torch.where(take_candidate, value, best_value)
+
     left = (beta0 - delta).clamp_min(lo)
     right = (beta0 + delta).clamp_max(hi)
     beta = beta0.clamp(left, right)
@@ -281,17 +276,13 @@ def _quartic_minimizer_on_interval(
         beta_new = beta_new.clamp(left, right)
         beta = torch.where(safe, beta_new, beta)
 
-    candidates = torch.stack([left, beta, right], dim=-1)
-    candidate_values = _eval_quartic(
-        c0.unsqueeze(-1),
-        c1.unsqueeze(-1),
-        c2.unsqueeze(-1),
-        c3.unsqueeze(-1),
-        c4.unsqueeze(-1),
-        candidates,
-    )
-    best = candidate_values.argmin(dim=-1)
-    return candidates.gather(-1, best.unsqueeze(-1)).squeeze(-1)
+    beta_value = _eval_quartic(c0, c1, c2, c3, c4, beta)
+    left_value = _eval_quartic(c0, c1, c2, c3, c4, left)
+    right_value = _eval_quartic(c0, c1, c2, c3, c4, right)
+
+    best = torch.where(left_value < beta_value, left, beta)
+    best_value = torch.minimum(left_value, beta_value)
+    return torch.where(right_value < best_value, right, best)
 
 
 def _adaptive_poly_first_order_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
