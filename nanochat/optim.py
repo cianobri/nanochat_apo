@@ -231,7 +231,7 @@ def _eval_quartic(c0: Tensor, c1: Tensor, c2: Tensor, c3: Tensor, c4: Tensor, be
     return (((c4 * beta + c3) * beta + c2) * beta + c1) * beta + c0
 
 
-def _quartic_minimizer_grid_newton(
+def _quartic_minimizer_on_interval(
     c0: Tensor,
     c1: Tensor,
     c2: Tensor,
@@ -239,9 +239,18 @@ def _quartic_minimizer_grid_newton(
     c4: Tensor,
     lo: float,
     hi: float,
-    n_grid: int,
-    n_newton: int,
+    n_grid: int = 17,
+    n_newton: int = 2,
 ) -> Tensor:
+    """
+    Approximate minimizer of
+
+        J(beta) = c0 + c1 beta + c2 beta^2 + c3 beta^3 + c4 beta^4
+
+    over [lo, hi]. Uses a fixed grid to select a local bracket, followed by
+    safeguarded Newton steps on J'(beta).
+    """
+
     beta_grid = torch.linspace(lo, hi, n_grid, dtype=c0.dtype, device=c0.device)
     beta_grid = beta_grid.reshape(*((1,) * c0.ndim), n_grid)
 
@@ -255,22 +264,25 @@ def _quartic_minimizer_grid_newton(
     )
     idx = values.argmin(dim=-1)
 
+    grid = beta_grid.expand(*c0.shape, n_grid)
     delta = (hi - lo) / float(n_grid - 1)
-    beta0 = beta_grid.expand(*c0.shape, n_grid).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    beta0 = grid.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
     left = (beta0 - delta).clamp_min(lo)
     right = (beta0 + delta).clamp_max(hi)
     beta = beta0.clamp(left, right)
 
+    eps = 32.0 * torch.finfo(beta.dtype).eps
     for _ in range(n_newton):
         jp = c1 + 2.0 * c2 * beta + 3.0 * c3 * beta.square() + 4.0 * c4 * beta.pow(3)
         jpp = 2.0 * c2 + 6.0 * c3 * beta + 12.0 * c4 * beta.square()
-        safe = jpp.abs() > (32.0 * torch.finfo(beta.dtype).eps)
-        beta_new = beta - jp / torch.where(safe, jpp, torch.ones_like(jpp))
+        safe = jpp.abs() > eps
+        denom = torch.where(safe, jpp, torch.ones_like(jpp))
+        beta_new = beta - jp / denom
         beta_new = beta_new.clamp(left, right)
         beta = torch.where(safe, beta_new, beta)
 
     candidates = torch.stack([left, beta, right], dim=-1)
-    vals = _eval_quartic(
+    candidate_values = _eval_quartic(
         c0.unsqueeze(-1),
         c1.unsqueeze(-1),
         c2.unsqueeze(-1),
@@ -278,7 +290,7 @@ def _quartic_minimizer_grid_newton(
         c4.unsqueeze(-1),
         candidates,
     )
-    best = vals.argmin(dim=-1)
+    best = candidate_values.argmin(dim=-1)
     return candidates.gather(-1, best.unsqueeze(-1)).squeeze(-1)
 
 
@@ -293,7 +305,7 @@ def _adaptive_poly_first_order_step(x: Tensor, eye: Tensor, ortho_grid: int, ort
     c3 = 4.0 * m[3] - 8.0 * m[4] + 4.0 * m[5]
     c4 = m[4] - 2.0 * m[5] + m[6]
 
-    beta = _quartic_minimizer_grid_newton(c0, c1, c2, c3, c4, 0.0, 1.0, ortho_grid, ortho_newton)
+    beta = _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, 0.0, 1.0, ortho_grid, ortho_newton)
     correction = eye + beta[..., None, None] * e
     return x @ correction
 
@@ -310,7 +322,7 @@ def _adaptive_poly_second_order_step(x: Tensor, eye: Tensor, ortho_grid: int, or
     c3 = 4.0 * m[6] - 6.0 * m[7] + 2.0 * m[9]
     c4 = m[8] - 2.0 * m[9] + m[10]
 
-    beta = _quartic_minimizer_grid_newton(c0, c1, c2, c3, c4, 0.0, 0.8, ortho_grid, ortho_newton)
+    beta = _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, 0.0, 0.8, ortho_grid, ortho_newton)
     correction = eye + 0.5 * e + beta[..., None, None] * e2
     return x @ correction
 
