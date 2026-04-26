@@ -78,7 +78,7 @@ run_method adaptive_poly_1 \
   --muon-orthogonalization=adaptive_poly \
   --model-tag=adaptive_poly_1 \
   --ortho-order=1 \
-  --ns-steps=2 \
+  --ns-steps=5 \
   --muon-norm-iters=0 \
   --print-every=50
 
@@ -92,6 +92,17 @@ run_method adaptive_poly_2 \
   --muon-orthogonalization=adaptive_poly \
   --model-tag=adaptive_poly_2 \
   --ortho-order=2 \
-  --ns-steps=1 \
+  --ns-steps=5 \
   --muon-norm-iters=0 \
+  --print-every=50
+
+run_method adamW \
+  --optimizer=adamw \
+  --core-metric-every=-1 \
+  --depth=14 \
+  --window-pattern=L \
+  --sample-every=-1 \
+  --save-every=-1 \
+  --run=dummy \
+  --model-tag=adamW \
   --print-every=50
