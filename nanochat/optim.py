@@ -119,6 +119,10 @@ def muon_step_polar_express_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
 ) -> None:
     """
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update.
@@ -135,7 +139,8 @@ def muon_step_polar_express_fused(
     # Polar Express
     # Cast to bf16 for speed when available; skip cast otherwise.
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if muon_norm_iters:
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
 
     if g.size(-2) > g.size(-1):  # Tall matrix
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -162,6 +167,10 @@ def muon_step_newton_schulz_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
 ) -> None:
     """
     Fused Muon step: momentum -> Newton-Schulz -> variance_reduction -> cautious_update.
@@ -177,16 +186,179 @@ def muon_step_newton_schulz_fused(
 
     # Newton-Schulz iteration for the zeroth power / orthogonalized update.
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+    if muon_norm_iters:
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
 
     if g.size(-2) > g.size(-1):  # Tall matrix
         for _ in range(ns_steps):
             A = X.mT @ X
-            X = 1.5 * X - 0.5 * (X @ A)
+            if ortho_order == 1:
+                X = 1.5 * X - 0.5 * (X @ A)
+            elif ortho_order == 2:
+                A2 = A @ A
+                X = X @ (1.875 * torch.eye(A.size(-1), dtype=A.dtype, device=A.device) - 1.25 * A + 0.375 * A2)
+            else:
+                raise ValueError(f"ortho_order must be 1 or 2, got {ortho_order}")
     else:  # Wide matrix
         for _ in range(ns_steps):
             A = X @ X.mT
-            X = 1.5 * X - 0.5 * (A @ X)
+            if ortho_order == 1:
+                X = 1.5 * X - 0.5 * (A @ X)
+            elif ortho_order == 2:
+                A2 = A @ A
+                X = (1.875 * torch.eye(A.size(-1), dtype=A.dtype, device=A.device) - 1.25 * A + 0.375 * A2) @ X
+            else:
+                raise ValueError(f"ortho_order must be 1 or 2, got {ortho_order}")
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+
+
+def _trace_mean(x: Tensor) -> Tensor:
+    return x.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / x.size(-1)
+
+
+def _error_moments(e: Tensor, max_k: int) -> list[Tensor]:
+    moments: list[Tensor] = [torch.empty(0, device=e.device, dtype=e.dtype)]
+    p = e
+    moments.append(_trace_mean(p))
+    for _ in range(2, max_k + 1):
+        p = p @ e
+        moments.append(_trace_mean(p))
+    return moments
+
+
+def _eval_quartic(c0: Tensor, c1: Tensor, c2: Tensor, c3: Tensor, c4: Tensor, beta: Tensor) -> Tensor:
+    return (((c4 * beta + c3) * beta + c2) * beta + c1) * beta + c0
+
+
+def _quartic_minimizer_grid_newton(
+    c0: Tensor,
+    c1: Tensor,
+    c2: Tensor,
+    c3: Tensor,
+    c4: Tensor,
+    lo: float,
+    hi: float,
+    n_grid: int,
+    n_newton: int,
+) -> Tensor:
+    beta_grid = torch.linspace(lo, hi, n_grid, dtype=c0.dtype, device=c0.device)
+    beta_grid = beta_grid.reshape(*((1,) * c0.ndim), n_grid)
+
+    values = _eval_quartic(
+        c0.unsqueeze(-1),
+        c1.unsqueeze(-1),
+        c2.unsqueeze(-1),
+        c3.unsqueeze(-1),
+        c4.unsqueeze(-1),
+        beta_grid,
+    )
+    idx = values.argmin(dim=-1)
+
+    delta = (hi - lo) / float(n_grid - 1)
+    beta0 = beta_grid.expand(*c0.shape, n_grid).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    left = (beta0 - delta).clamp_min(lo)
+    right = (beta0 + delta).clamp_max(hi)
+    beta = beta0.clamp(left, right)
+
+    for _ in range(n_newton):
+        jp = c1 + 2.0 * c2 * beta + 3.0 * c3 * beta.square() + 4.0 * c4 * beta.pow(3)
+        jpp = 2.0 * c2 + 6.0 * c3 * beta + 12.0 * c4 * beta.square()
+        safe = jpp.abs() > (32.0 * torch.finfo(beta.dtype).eps)
+        beta_new = beta - jp / torch.where(safe, jpp, torch.ones_like(jpp))
+        beta_new = beta_new.clamp(left, right)
+        beta = torch.where(safe, beta_new, beta)
+
+    candidates = torch.stack([left, beta, right], dim=-1)
+    vals = _eval_quartic(
+        c0.unsqueeze(-1),
+        c1.unsqueeze(-1),
+        c2.unsqueeze(-1),
+        c3.unsqueeze(-1),
+        c4.unsqueeze(-1),
+        candidates,
+    )
+    best = vals.argmin(dim=-1)
+    return candidates.gather(-1, best.unsqueeze(-1)).squeeze(-1)
+
+
+def _adaptive_poly_first_order_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+    g = x.mT @ x
+    e = eye - g
+    m = _error_moments(e, 6)
+
+    c0 = m[2]
+    c1 = -4.0 * m[2] + 4.0 * m[3]
+    c2 = 4.0 * m[2] - 10.0 * m[3] + 6.0 * m[4]
+    c3 = 4.0 * m[3] - 8.0 * m[4] + 4.0 * m[5]
+    c4 = m[4] - 2.0 * m[5] + m[6]
+
+    beta = _quartic_minimizer_grid_newton(c0, c1, c2, c3, c4, 0.0, 1.0, ortho_grid, ortho_newton)
+    correction = eye + beta[..., None, None] * e
+    return x @ correction
+
+
+def _adaptive_poly_second_order_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+    g = x.mT @ x
+    e = eye - g
+    e2 = e @ e
+    m = _error_moments(e, 10)
+
+    c0 = (9.0 / 16.0) * m[4] + (3.0 / 8.0) * m[5] + (1.0 / 16.0) * m[6]
+    c1 = -3.0 * m[4] + 0.5 * m[5] + 2.0 * m[6] + 0.5 * m[7]
+    c2 = 4.0 * m[4] - 4.0 * m[5] - 4.5 * m[6] + 3.0 * m[7] + 1.5 * m[8]
+    c3 = 4.0 * m[6] - 6.0 * m[7] + 2.0 * m[9]
+    c4 = m[8] - 2.0 * m[9] + m[10]
+
+    beta = _quartic_minimizer_grid_newton(c0, c1, c2, c3, c4, 0.0, 0.8, ortho_grid, ortho_newton)
+    correction = eye + 0.5 * e + beta[..., None, None] * e2
+    return x @ correction
+
+
+def muon_step_adaptive_poly_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> adaptive polynomial orthogonalization
+    -> variance_reduction -> cautious_update.
+    """
+
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = g.float()
+    if muon_norm_iters:
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+
+    transposed = g.size(-2) <= g.size(-1)
+    if transposed:
+        X = X.mT
+
+    eye = torch.eye(X.size(-1), dtype=X.dtype, device=X.device).expand(*X.shape[:-2], X.size(-1), X.size(-1))
+    for _ in range(ns_steps):
+        if ortho_order == 1:
+            X = _adaptive_poly_first_order_step(X, eye, ortho_grid, ortho_newton)
+        elif ortho_order == 2:
+            X = _adaptive_poly_second_order_step(X, eye, ortho_grid, ortho_newton)
+        else:
+            raise ValueError(f"ortho_order must be 1 or 2, got {ortho_order}")
+
+    if transposed:
+        X = X.mT
 
     _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
 
@@ -197,6 +369,8 @@ def _get_muon_step_fn(group: dict):
         return muon_step_polar_express_fused
     if orthogonalization == "newton_schulz":
         return muon_step_newton_schulz_fused
+    if orthogonalization == "adaptive_poly":
+        return muon_step_adaptive_poly_fused
     raise ValueError(f"Unknown Muon orthogonalization method: {orthogonalization}")
 
 
@@ -212,6 +386,7 @@ if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
     muon_step_polar_express_fused = torch.compile(muon_step_polar_express_fused, dynamic=False, fullgraph=True)
     muon_step_newton_schulz_fused = torch.compile(muon_step_newton_schulz_fused, dynamic=False, fullgraph=True)
+    muon_step_adaptive_poly_fused = torch.compile(muon_step_adaptive_poly_fused, dynamic=False, fullgraph=True)
 
 
 # -----------------------------------------------------------------------------
@@ -227,7 +402,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - 'params': List of parameters
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization', 'beta2', 'weight_decay'
+            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization',
+              'muon_norm_iters', 'ortho_order', 'ortho_grid', 'ortho_newton',
+              'beta2', 'weight_decay'
     """
 
     def __init__(self, param_groups: list[dict]):
@@ -331,6 +508,10 @@ class MuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t,
             group["ns_steps"],
             red_dim,
+            bool(group.get("muon_norm_iters", True)),
+            group.get("ortho_order", 1),
+            group.get("ortho_grid", 17),
+            group.get("ortho_newton", 2),
         )
 
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
@@ -522,6 +703,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._muon_beta2_t,
                 group["ns_steps"],
                 red_dim,
+                bool(group.get("muon_norm_iters", True)),
+                group.get("ortho_order", 1),
+                group.get("ortho_grid", 17),
+                group.get("ortho_newton", 2),
             )
 
             updated_params[:num_owned].copy_(stacked_owned)

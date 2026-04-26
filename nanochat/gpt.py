@@ -371,11 +371,19 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express", optimizer="adamw_muon"):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express", muon_norm_iters=1, ortho_order=1, ortho_grid=17, ortho_newton=2, optimizer="adamw_muon"):
         if optimizer not in {"adamw", "adamw_muon"}:
             raise ValueError(f"Unknown optimizer: {optimizer}")
-        if muon_orthogonalization not in {"polar_express", "newton_schulz"}:
+        if muon_orthogonalization not in {"polar_express", "newton_schulz", "adaptive_poly"}:
             raise ValueError(f"Unknown Muon orthogonalization method: {muon_orthogonalization}")
+        if muon_norm_iters not in {0, 1, False, True}:
+            raise ValueError("muon_norm_iters must be 0 or 1")
+        if ortho_order not in {1, 2}:
+            raise ValueError("ortho_order must be 1 or 2")
+        if ortho_grid < 2:
+            raise ValueError("ortho_grid must be at least 2")
+        if ortho_newton < 0:
+            raise ValueError("ortho_newton must be non-negative")
         if optimizer == "adamw_muon":
             if ns_steps < 1:
                 raise ValueError("ns_steps must be at least 1")
@@ -418,6 +426,8 @@ class GPT(nn.Module):
                 param_groups.append(dict(
                     kind='muon', params=group_params, lr=matrix_lr,
                     momentum=0.95, ns_steps=ns_steps, orthogonalization=muon_orthogonalization,
+                    muon_norm_iters=bool(muon_norm_iters), ortho_order=ortho_order,
+                    ortho_grid=ortho_grid, ortho_newton=ortho_newton,
                     beta2=0.9, weight_decay=weight_decay,
                 ))
 
