@@ -56,6 +56,7 @@ parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate
 parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "adamw_muon"], help="optimizer to use (default: inherit from pretrain)")
 parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default=None, choices=["polar_express", "newton_schulz", "adaptive_poly"], help="orthogonalization method for Muon updates (default: inherit from pretrain)")
 parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=None, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (default: inherit from pretrain)")
+parser.add_argument("--muon-orthogonalization-dtype", "--muon_orthogonalization_dtype", type=str, default=None, choices=["param", "float32", "bfloat16", "float16"], help="dtype used inside Muon orthogonalization (default: inherit from pretrain)")
 parser.add_argument("--ortho-order", "--ortho_order", type=int, default=None, choices=[1, 2], help="polynomial order for adaptive_poly Muon orthogonalization (default: inherit from pretrain)")
 parser.add_argument("--ortho-grid", "--ortho_grid", type=int, default=None, help="grid points for adaptive_poly beta solve (default: inherit from pretrain)")
 parser.add_argument("--ortho-newton", "--ortho_newton", type=int, default=None, help="Newton refinement steps for adaptive_poly beta solve (default: inherit from pretrain)")
@@ -113,6 +114,7 @@ for name, fallback, source in [
     ("optimizer",         "adamw_muon", pretrain_user_config),
     ("muon_orthogonalization", "polar_express", pretrain_user_config),
     ("muon_norm_iters",   1,     pretrain_user_config),
+    ("muon_orthogonalization_dtype", "float32", pretrain_user_config),
     ("ortho_order",       1,     pretrain_user_config),
     ("ortho_grid",        17,    pretrain_user_config),
     ("ortho_newton",      2,     pretrain_user_config),
@@ -147,7 +149,7 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0, optimizer=args.optimizer, muon_orthogonalization=args.muon_orthogonalization, muon_norm_iters=args.muon_norm_iters, ortho_order=args.ortho_order, ortho_grid=args.ortho_grid, ortho_newton=args.ortho_newton)
+optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0, optimizer=args.optimizer, muon_orthogonalization=args.muon_orthogonalization, muon_norm_iters=args.muon_norm_iters, muon_orthogonalization_dtype=args.muon_orthogonalization_dtype, ortho_order=args.ortho_order, ortho_grid=args.ortho_grid, ortho_newton=args.ortho_newton)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the

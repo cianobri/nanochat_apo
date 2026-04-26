@@ -13,9 +13,6 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from nanochat.common import COMPUTE_DTYPE
-
-
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.
@@ -74,6 +71,33 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+_MUON_ORTHO_DTYPE_CODES = {
+    "param": 0,
+    "float32": 1,
+    "bfloat16": 2,
+    "float16": 3,
+}
+
+
+def _get_muon_orthogonalization_dtype_code(group: dict) -> int:
+    dtype_name = group.get("orthogonalization_dtype", "float32")
+    if dtype_name not in _MUON_ORTHO_DTYPE_CODES:
+        choices = ", ".join(_MUON_ORTHO_DTYPE_CODES)
+        raise ValueError(f"Unknown Muon orthogonalization dtype: {dtype_name} (choices: {choices})")
+    return _MUON_ORTHO_DTYPE_CODES[dtype_name]
+
+
+def _cast_muon_orthogonalization_input(g: Tensor, dtype_code: int) -> Tensor:
+    if dtype_code == 0:
+        return g
+    if dtype_code == 1:
+        return g.float()
+    if dtype_code == 2:
+        return g.bfloat16()
+    if dtype_code == 3:
+        return g.half()
+    raise ValueError(f"Unknown Muon orthogonalization dtype code: {dtype_code}")
+
 
 def _finish_muon_step(
     g: Tensor,
@@ -123,6 +147,7 @@ def muon_step_polar_express_fused(
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
+    ortho_dtype_code: int,
 ) -> None:
     """
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update.
@@ -137,8 +162,7 @@ def muon_step_polar_express_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     # Polar Express
-    # Cast to bf16 for speed when available; skip cast otherwise.
-    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
     if muon_norm_iters:
         X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
 
@@ -171,6 +195,7 @@ def muon_step_newton_schulz_fused(
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
+    ortho_dtype_code: int,
 ) -> None:
     """
     Fused Muon step: momentum -> Newton-Schulz -> variance_reduction -> cautious_update.
@@ -185,7 +210,7 @@ def muon_step_newton_schulz_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     # Newton-Schulz iteration for the zeroth power / orthogonalized update.
-    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
     if muon_norm_iters:
         X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
 
@@ -333,6 +358,7 @@ def muon_step_adaptive_poly_fused(
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
+    ortho_dtype_code: int,
 ) -> None:
     """
     Fused Muon step: momentum -> adaptive polynomial orthogonalization
@@ -343,7 +369,7 @@ def muon_step_adaptive_poly_fused(
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    X = g.float()
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
     if muon_norm_iters:
         X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
 
@@ -407,7 +433,7 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization',
               'muon_norm_iters', 'ortho_order', 'ortho_grid', 'ortho_newton',
-              'beta2', 'weight_decay'
+              'orthogonalization_dtype', 'beta2', 'weight_decay'
     """
 
     def __init__(self, param_groups: list[dict]):
@@ -515,6 +541,7 @@ class MuonAdamW(torch.optim.Optimizer):
             group.get("ortho_order", 1),
             group.get("ortho_grid", 17),
             group.get("ortho_newton", 2),
+            _get_muon_orthogonalization_dtype_code(group),
         )
 
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
@@ -710,6 +737,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 group.get("ortho_order", 1),
                 group.get("ortho_grid", 17),
                 group.get("ortho_newton", 2),
+                _get_muon_orthogonalization_dtype_code(group),
             )
 
             updated_params[:num_owned].copy_(stacked_owned)

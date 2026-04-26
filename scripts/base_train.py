@@ -68,6 +68,7 @@ parser.add_argument("--optimizer", type=str, default="adamw_muon", choices=["ada
 parser.add_argument("--ns-steps", "--ns_steps", type=int, default=5, help="number of Newton-Schulz/Polar Express iterations for Muon")
 parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly"], help="orthogonalization method for Muon updates")
 parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=1, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (1=normalize, 0=skip)")
+parser.add_argument("--muon-orthogonalization-dtype", "--muon_orthogonalization_dtype", type=str, default="float32", choices=["param", "float32", "bfloat16", "float16"], help="dtype used inside Muon orthogonalization")
 parser.add_argument("--ortho-order", "--ortho_order", type=int, default=1, choices=[1, 2], help="polynomial order for adaptive_poly Muon orthogonalization")
 parser.add_argument("--ortho-grid", "--ortho_grid", type=int, default=17, help="grid points for adaptive_poly beta solve")
 parser.add_argument("--ortho-newton", "--ortho_newton", type=int, default=2, help="Newton refinement steps for adaptive_poly beta solve")
@@ -333,6 +334,7 @@ optimizer = model.setup_optimizer(
     ns_steps=args.ns_steps,
     muon_orthogonalization=args.muon_orthogonalization,
     muon_norm_iters=args.muon_norm_iters,
+    muon_orthogonalization_dtype=args.muon_orthogonalization_dtype,
     ortho_order=args.ortho_order,
     ortho_grid=args.ortho_grid,
     ortho_newton=args.ortho_newton,
