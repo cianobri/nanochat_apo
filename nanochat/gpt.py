@@ -374,7 +374,7 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express", muon_norm_iters=1, muon_orthogonalization_dtype="float32", ortho_order=1, ortho_grid=17, ortho_newton=2, optimizer="adamw_muon"):
         if optimizer not in {"adamw", "adamw_muon"}:
             raise ValueError(f"Unknown optimizer: {optimizer}")
-        if muon_orthogonalization not in {"polar_express", "newton_schulz", "adaptive_poly", "muon_adhoc"}:
+        if muon_orthogonalization not in {"polar_express", "newton_schulz", "adaptive_poly", "adaptive_greedy", "muon_adhoc"}:
             raise ValueError(f"Unknown Muon orthogonalization method: {muon_orthogonalization}")
         if muon_norm_iters not in {0, 1, False, True}:
             raise ValueError("muon_norm_iters must be 0 or 1")

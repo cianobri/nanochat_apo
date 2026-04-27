@@ -392,6 +392,48 @@ def _adaptive_poly_second_order_step(x: Tensor, eye: Tensor, ortho_grid: int, or
     return x @ correction
 
 
+def _adaptive_greedy_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+    g = x.mT @ x
+    e = eye - g
+    e2 = e @ e
+    m = _error_moments(e, 10)
+
+    c0 = m[2]
+    c1 = -4.0 * m[2] + 4.0 * m[3]
+    c2 = 4.0 * m[2] - 10.0 * m[3] + 6.0 * m[4]
+    c3 = 4.0 * m[3] - 8.0 * m[4] + 4.0 * m[5]
+    c4 = m[4] - 2.0 * m[5] + m[6]
+    gamma = _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, 0.0, 2.0, ortho_grid, ortho_newton)
+
+    zero = torch.zeros_like(gamma)
+    r = [
+        (1.0 - 2.0 * gamma, zero, zero),
+        (2.0 * gamma - gamma.square(), torch.full_like(gamma, -2.0), zero),
+        (gamma.square(), 2.0 - 2.0 * gamma, zero),
+        (zero, 2.0 * gamma, torch.full_like(gamma, -1.0)),
+        (zero, zero, torch.ones_like(gamma)),
+    ]
+
+    coeffs = [torch.zeros_like(gamma) for _ in range(5)]
+    for i in range(5):
+        ai, bi, ci = r[i]
+        for j in range(5):
+            aj, bj, cj = r[j]
+            moment = m[i + j + 2]
+            coeffs[0] = coeffs[0] + ai * aj * moment
+            coeffs[1] = coeffs[1] + (ai * bj + bi * aj) * moment
+            coeffs[2] = coeffs[2] + (ai * cj + bi * bj + ci * aj) * moment
+            coeffs[3] = coeffs[3] + (bi * cj + ci * bj) * moment
+            coeffs[4] = coeffs[4] + ci * cj * moment
+
+    beta = _quartic_minimizer_on_interval(
+        coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
+        0.0, 0.8, ortho_grid, ortho_newton,
+    )
+    correction = eye + gamma[..., None, None] * e + beta[..., None, None] * e2
+    return x @ correction
+
+
 def muon_step_adaptive_poly_fused(
     stacked_grads: Tensor,
     stacked_params: Tensor,
@@ -441,6 +483,53 @@ def muon_step_adaptive_poly_fused(
     _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
 
 
+def muon_step_adaptive_greedy_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
+    ortho_dtype_code: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> adaptive greedy polynomial orthogonalization
+    -> variance_reduction -> cautious_update.
+    """
+
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
+
+    transposed = g.size(-2) <= g.size(-1)
+    if transposed:
+        X = X.mT
+
+    g0 = X.mT @ X
+    x_norm = X.norm(dim=(-2, -1), keepdim=True)
+    g_norm = g0.norm(dim=(-2, -1), keepdim=True)
+    X = X * (x_norm / (g_norm + 1e-6))
+
+    eye = torch.eye(X.size(-1), dtype=X.dtype, device=X.device).expand(*X.shape[:-2], X.size(-1), X.size(-1))
+    for _ in range(ns_steps):
+        X = _adaptive_greedy_step(X, eye, ortho_grid, ortho_newton)
+
+    if transposed:
+        X = X.mT
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+
+
 def _get_muon_step_fn(group: dict):
     orthogonalization = group.get("orthogonalization", "polar_express")
     if orthogonalization == "polar_express":
@@ -449,6 +538,8 @@ def _get_muon_step_fn(group: dict):
         return muon_step_newton_schulz_fused
     if orthogonalization == "adaptive_poly":
         return muon_step_adaptive_poly_fused
+    if orthogonalization == "adaptive_greedy":
+        return muon_step_adaptive_greedy_fused
     if orthogonalization == "muon_adhoc":
         return muon_step_adhoc_fused
     raise ValueError(f"Unknown Muon orthogonalization method: {orthogonalization}")
@@ -468,6 +559,7 @@ if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     muon_step_newton_schulz_fused = torch.compile(muon_step_newton_schulz_fused, dynamic=False, fullgraph=True)
     muon_step_adhoc_fused = torch.compile(muon_step_adhoc_fused, dynamic=False, fullgraph=True)
     muon_step_adaptive_poly_fused = torch.compile(muon_step_adaptive_poly_fused, dynamic=False, fullgraph=True)
+    muon_step_adaptive_greedy_fused = torch.compile(muon_step_adaptive_greedy_fused, dynamic=False, fullgraph=True)
 
 
 # -----------------------------------------------------------------------------

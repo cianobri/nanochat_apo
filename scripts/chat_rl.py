@@ -52,7 +52,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--optimizer", type=str, default="adamw_muon", choices=["adamw", "adamw_muon"], help="optimizer to use: AdamW only, or AdamW for non-matrix params plus Muon for matrix params")
-parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly", "muon_adhoc"], help="orthogonalization method for Muon updates")
+parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly", "adaptive_greedy", "muon_adhoc"], help="orthogonalization method for Muon updates")
 parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=1, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (1=normalize, 0=skip)")
 parser.add_argument("--muon-orthogonalization-dtype", "--muon_orthogonalization_dtype", type=str, default="float32", choices=["param", "float32", "bfloat16", "float16"], help="dtype used inside Muon orthogonalization")
 parser.add_argument("--ortho-order", "--ortho_order", type=int, default=1, choices=[1, 2], help="polynomial order for adaptive_poly Muon orthogonalization")
