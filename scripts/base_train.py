@@ -66,7 +66,7 @@ parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious w
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--optimizer", type=str, default="adamw_muon", choices=["adamw", "adamw_muon"], help="optimizer to use: AdamW only, or AdamW for non-matrix params plus Muon for matrix params")
 parser.add_argument("--ns-steps", "--ns_steps", type=int, default=5, help="number of Newton-Schulz/Polar Express iterations for Muon")
-parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly"], help="orthogonalization method for Muon updates")
+parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly", "muon_adhoc"], help="orthogonalization method for Muon updates")
 parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=1, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (1=normalize, 0=skip)")
 parser.add_argument("--muon-orthogonalization-dtype", "--muon_orthogonalization_dtype", type=str, default="float32", choices=["param", "float32", "bfloat16", "float16"], help="dtype used inside Muon orthogonalization")
 parser.add_argument("--ortho-order", "--ortho_order", type=int, default=1, choices=[1, 2], help="polynomial order for adaptive_poly Muon orthogonalization")
@@ -500,7 +500,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    if args.save_every != -1 and (last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0)):
         save_checkpoint(
             checkpoint_dir,
             step,

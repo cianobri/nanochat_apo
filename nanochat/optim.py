@@ -71,6 +71,9 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+# Original Muon fixed quintic Newton-Schulz coefficients, selected by search.
+muon_adhoc_coeffs = (3.4445, -4.7750, 2.0315)
+
 _MUON_ORTHO_DTYPE_CODES = {
     "param": 0,
     "float32": 1,
@@ -238,6 +241,52 @@ def muon_step_newton_schulz_fused(
     _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
 
 
+def muon_step_adhoc_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
+    ortho_dtype_code: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> fixed-coefficient quintic Newton-Schulz
+    -> variance_reduction -> cautious_update.
+    """
+
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
+    if muon_norm_iters:
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+
+    a, b, c = muon_adhoc_coeffs
+    if g.size(-2) > g.size(-1):  # Tall matrix
+        for _ in range(ns_steps):
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:  # Wide matrix
+        for _ in range(ns_steps):
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+
+
 def _trace_mean(x: Tensor) -> Tensor:
     return x.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / x.size(-1)
 
@@ -400,6 +449,8 @@ def _get_muon_step_fn(group: dict):
         return muon_step_newton_schulz_fused
     if orthogonalization == "adaptive_poly":
         return muon_step_adaptive_poly_fused
+    if orthogonalization == "muon_adhoc":
+        return muon_step_adhoc_fused
     raise ValueError(f"Unknown Muon orthogonalization method: {orthogonalization}")
 
 
@@ -415,6 +466,7 @@ if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
     muon_step_polar_express_fused = torch.compile(muon_step_polar_express_fused, dynamic=False, fullgraph=True)
     muon_step_newton_schulz_fused = torch.compile(muon_step_newton_schulz_fused, dynamic=False, fullgraph=True)
+    muon_step_adhoc_fused = torch.compile(muon_step_adhoc_fused, dynamic=False, fullgraph=True)
     muon_step_adaptive_poly_fused = torch.compile(muon_step_adaptive_poly_fused, dynamic=False, fullgraph=True)
 
 
