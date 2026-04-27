@@ -102,6 +102,12 @@ def _cast_muon_orthogonalization_input(g: Tensor, dtype_code: int) -> Tensor:
     raise ValueError(f"Unknown Muon orthogonalization dtype code: {dtype_code}")
 
 
+def _maybe_normalize_muon_orthogonalization_input(x: Tensor, muon_norm_iters: bool) -> Tensor:
+    if muon_norm_iters:
+        return x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+    return x
+
+
 def _finish_muon_step(
     g: Tensor,
     stacked_params: Tensor,
@@ -166,8 +172,7 @@ def muon_step_polar_express_fused(
 
     # Polar Express
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    if muon_norm_iters:
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
 
     if g.size(-2) > g.size(-1):  # Tall matrix
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -214,8 +219,7 @@ def muon_step_newton_schulz_fused(
 
     # Newton-Schulz iteration for the zeroth power / orthogonalized update.
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    if muon_norm_iters:
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
 
     if g.size(-2) > g.size(-1):  # Tall matrix
         for _ in range(ns_steps):
@@ -269,8 +273,7 @@ def muon_step_adhoc_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    if muon_norm_iters:
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
 
     a, b, c = muon_adhoc_coeffs
     if g.size(-2) > g.size(-1):  # Tall matrix
@@ -292,7 +295,7 @@ def _trace_mean(x: Tensor) -> Tensor:
 
 
 def _error_moments(e: Tensor, max_k: int) -> list[Tensor]:
-    moments: list[Tensor] = [torch.empty(0, device=e.device, dtype=e.dtype)]
+    moments: list[Tensor] = [torch.ones(e.shape[:-2], dtype=e.dtype, device=e.device)]
     p = e
     moments.append(_trace_mean(p))
     for _ in range(2, max_k + 1):
@@ -359,79 +362,99 @@ def _quartic_minimizer_on_interval(
     return torch.where(right_value < best_value, right, best)
 
 
-def _adaptive_poly_first_order_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
-    g = x.mT @ x
-    e = eye - g
-    m = _error_moments(e, 6)
-
-    c0 = m[2]
-    c1 = -4.0 * m[2] + 4.0 * m[3]
-    c2 = 4.0 * m[2] - 10.0 * m[3] + 6.0 * m[4]
-    c3 = 4.0 * m[3] - 8.0 * m[4] + 4.0 * m[5]
-    c4 = m[4] - 2.0 * m[5] + m[6]
-
-    beta = _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, 0.0, 1.0, ortho_grid, ortho_newton)
-    correction = eye + beta[..., None, None] * e
-    return x @ correction
-
-
-def _adaptive_poly_second_order_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
-    g = x.mT @ x
-    e = eye - g
-    e2 = e @ e
-    m = _error_moments(e, 10)
-
-    c0 = (9.0 / 16.0) * m[4] + (3.0 / 8.0) * m[5] + (1.0 / 16.0) * m[6]
-    c1 = -3.0 * m[4] + 0.5 * m[5] + 2.0 * m[6] + 0.5 * m[7]
-    c2 = 4.0 * m[4] - 4.0 * m[5] - 4.5 * m[6] + 3.0 * m[7] + 1.5 * m[8]
-    c3 = 4.0 * m[6] - 6.0 * m[7] + 2.0 * m[9]
-    c4 = m[8] - 2.0 * m[9] + m[10]
-
-    beta = _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, 0.0, 0.8, ortho_grid, ortho_newton)
-    correction = eye + 0.5 * e + beta[..., None, None] * e2
-    return x @ correction
+def _optimal_beta_first_order_from_error_moments(
+    moments: list[Tensor],
+    beta_min: float,
+    beta_max: float,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> Tensor:
+    m2, m3, m4, m5, m6 = moments[2], moments[3], moments[4], moments[5], moments[6]
+    c0 = m2
+    c1 = -4.0 * m2 + 4.0 * m3
+    c2 = 4.0 * m2 - 10.0 * m3 + 6.0 * m4
+    c3 = 4.0 * m3 - 8.0 * m4 + 4.0 * m5
+    c4 = m4 - 2.0 * m5 + m6
+    return _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, beta_min, beta_max, ortho_grid, ortho_newton)
 
 
-def _adaptive_greedy_step(x: Tensor, eye: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
-    g = x.mT @ x
-    e = eye - g
-    e2 = e @ e
-    m = _error_moments(e, 10)
+def _optimal_gamma_second_order_from_error_moments(
+    moments: list[Tensor],
+    gamma_min: float,
+    gamma_max: float,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> Tensor:
+    m4, m5, m6 = moments[4], moments[5], moments[6]
+    m7, m8, m9, m10 = moments[7], moments[8], moments[9], moments[10]
+    c0 = (9.0 / 16.0) * m4 + (3.0 / 8.0) * m5 + (1.0 / 16.0) * m6
+    c1 = -3.0 * m4 + 0.5 * m5 + 2.0 * m6 + 0.5 * m7
+    c2 = 4.0 * m4 - 4.0 * m5 - 4.5 * m6 + 3.0 * m7 + 1.5 * m8
+    c3 = 4.0 * m6 - 6.0 * m7 + 2.0 * m9
+    c4 = m8 - 2.0 * m9 + m10
+    return _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, gamma_min, gamma_max, ortho_grid, ortho_newton)
 
-    c0 = m[2]
-    c1 = -4.0 * m[2] + 4.0 * m[3]
-    c2 = 4.0 * m[2] - 10.0 * m[3] + 6.0 * m[4]
-    c3 = 4.0 * m[3] - 8.0 * m[4] + 4.0 * m[5]
-    c4 = m[4] - 2.0 * m[5] + m[6]
-    gamma = _quartic_minimizer_on_interval(c0, c1, c2, c3, c4, 0.0, 2.0, ortho_grid, ortho_newton)
 
-    zero = torch.zeros_like(gamma)
-    r = [
-        (1.0 - 2.0 * gamma, zero, zero),
-        (2.0 * gamma - gamma.square(), torch.full_like(gamma, -2.0), zero),
-        (gamma.square(), 2.0 - 2.0 * gamma, zero),
-        (zero, 2.0 * gamma, torch.full_like(gamma, -1.0)),
-        (zero, zero, torch.ones_like(gamma)),
+def _optimal_gamma_with_fixed_beta_from_error_moments(
+    moments: list[Tensor],
+    beta: Tensor,
+    gamma_min: float,
+    gamma_max: float,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> Tensor:
+    zero = torch.zeros_like(beta)
+    one = torch.ones_like(beta)
+    r_terms: list[tuple[Tensor, Tensor, Tensor]] = [
+        (one - 2.0 * beta, zero, zero),
+        (2.0 * beta - beta.square(), -2.0 * one, zero),
+        (beta.square(), 2.0 * one - 2.0 * beta, zero),
+        (zero, 2.0 * beta, -1.0 * one),
+        (zero, zero, one),
     ]
-
-    coeffs = [torch.zeros_like(gamma) for _ in range(5)]
-    for i in range(5):
-        ai, bi, ci = r[i]
-        for j in range(5):
-            aj, bj, cj = r[j]
-            moment = m[i + j + 2]
+    coeffs = [torch.zeros_like(beta) for _ in range(5)]
+    for i, (ai, bi, ci) in enumerate(r_terms, start=1):
+        for j, (aj, bj, cj) in enumerate(r_terms, start=1):
+            moment = moments[i + j]
             coeffs[0] = coeffs[0] + ai * aj * moment
             coeffs[1] = coeffs[1] + (ai * bj + bi * aj) * moment
             coeffs[2] = coeffs[2] + (ai * cj + bi * bj + ci * aj) * moment
             coeffs[3] = coeffs[3] + (bi * cj + ci * bj) * moment
             coeffs[4] = coeffs[4] + ci * cj * moment
-
-    beta = _quartic_minimizer_on_interval(
+    return _quartic_minimizer_on_interval(
         coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
-        0.0, 0.8, ortho_grid, ortho_newton,
+        gamma_min, gamma_max, ortho_grid, ortho_newton,
     )
-    correction = eye + gamma[..., None, None] * e + beta[..., None, None] * e2
-    return x @ correction
+
+
+def _adaptive_poly_first_order_error_step(x: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+    g = x.mT @ x
+    eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
+    e = eye - g
+    moments = _error_moments(e, 6)
+    beta = _optimal_beta_first_order_from_error_moments(moments, 0.0, 1.0, ortho_grid, ortho_newton)
+    return x @ (eye + beta[..., None, None] * e)
+
+
+def _adaptive_poly_second_order_error_step(x: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+    g = x.mT @ x
+    eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
+    e = eye - g
+    e2 = e @ e
+    moments = _error_moments(e, 10)
+    gamma = _optimal_gamma_second_order_from_error_moments(moments, 0.0, 0.8, ortho_grid, ortho_newton)
+    return x @ (eye + 0.5 * e + gamma[..., None, None] * e2)
+
+
+def _gso_error_step(x: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+    g = x.mT @ x
+    eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
+    e = eye - g
+    e2 = e @ e
+    moments = _error_moments(e, 10)
+    beta = _optimal_beta_first_order_from_error_moments(moments, 0.0, 2.0, ortho_grid, ortho_newton)
+    gamma = _optimal_gamma_with_fixed_beta_from_error_moments(moments, beta, 0.0, 0.8, ortho_grid, ortho_newton)
+    return x @ (eye + beta[..., None, None] * e + gamma[..., None, None] * e2)
 
 
 def muon_step_adaptive_poly_fused(
@@ -452,7 +475,56 @@ def muon_step_adaptive_poly_fused(
     ortho_dtype_code: int,
 ) -> None:
     """
-    Fused Muon step: momentum -> adaptive polynomial orthogonalization
+    Fused Muon step: momentum -> error-basis adaptive polynomial orthogonalization
+    -> variance_reduction -> cautious_update.
+
+    Uses first-order or second-order error-basis APO depending on ortho_order.
+    """
+
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
+    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+
+    transposed = g.size(-2) <= g.size(-1)
+    if transposed:
+        X = X.mT
+
+    for _ in range(ns_steps):
+        if ortho_order == 1:
+            X = _adaptive_poly_first_order_error_step(X, ortho_grid, ortho_newton)
+        elif ortho_order == 2:
+            X = _adaptive_poly_second_order_error_step(X, ortho_grid, ortho_newton)
+        else:
+            raise ValueError(f"ortho_order must be 1 or 2, got {ortho_order}")
+
+    if transposed:
+        X = X.mT
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+
+
+def muon_step_gso_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
+    ortho_dtype_code: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> greedy second-order error-basis adaptive polynomial
     -> variance_reduction -> cautious_update.
     """
 
@@ -461,21 +533,14 @@ def muon_step_adaptive_poly_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    if muon_norm_iters:
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
 
     transposed = g.size(-2) <= g.size(-1)
     if transposed:
         X = X.mT
 
-    eye = torch.eye(X.size(-1), dtype=X.dtype, device=X.device).expand(*X.shape[:-2], X.size(-1), X.size(-1))
     for _ in range(ns_steps):
-        if ortho_order == 1:
-            X = _adaptive_poly_first_order_step(X, eye, ortho_grid, ortho_newton)
-        elif ortho_order == 2:
-            X = _adaptive_poly_second_order_step(X, eye, ortho_grid, ortho_newton)
-        else:
-            raise ValueError(f"ortho_order must be 1 or 2, got {ortho_order}")
+        X = _gso_error_step(X, ortho_grid, ortho_newton)
 
     if transposed:
         X = X.mT
@@ -501,33 +566,27 @@ def muon_step_adaptive_greedy_fused(
     ortho_dtype_code: int,
 ) -> None:
     """
-    Fused Muon step: momentum -> adaptive greedy polynomial orthogonalization
-    -> variance_reduction -> cautious_update.
+    Legacy compatibility alias for gso.
+
+    The old Gram-basis adaptive greedy path is intentionally not exposed.
     """
-
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-
-    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-
-    transposed = g.size(-2) <= g.size(-1)
-    if transposed:
-        X = X.mT
-
-    g0 = X.mT @ X
-    x_norm = X.norm(dim=(-2, -1), keepdim=True)
-    g_norm = g0.norm(dim=(-2, -1), keepdim=True)
-    X = X * (x_norm / (g_norm + 1e-6))
-
-    eye = torch.eye(X.size(-1), dtype=X.dtype, device=X.device).expand(*X.shape[:-2], X.size(-1), X.size(-1))
-    for _ in range(ns_steps):
-        X = _adaptive_greedy_step(X, eye, ortho_grid, ortho_newton)
-
-    if transposed:
-        X = X.mT
-
-    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+    muon_step_gso_fused(
+        stacked_grads,
+        stacked_params,
+        momentum_buffer,
+        second_momentum_buffer,
+        momentum_t,
+        lr_t,
+        wd_t,
+        beta2_t,
+        ns_steps,
+        red_dim,
+        muon_norm_iters,
+        ortho_order,
+        ortho_grid,
+        ortho_newton,
+        ortho_dtype_code,
+    )
 
 
 def _get_muon_step_fn(group: dict):
@@ -538,8 +597,10 @@ def _get_muon_step_fn(group: dict):
         return muon_step_newton_schulz_fused
     if orthogonalization == "adaptive_poly":
         return muon_step_adaptive_poly_fused
+    if orthogonalization == "gso":
+        return muon_step_gso_fused
     if orthogonalization == "adaptive_greedy":
-        return muon_step_adaptive_greedy_fused
+        return muon_step_gso_fused
     if orthogonalization == "muon_adhoc":
         return muon_step_adhoc_fused
     raise ValueError(f"Unknown Muon orthogonalization method: {orthogonalization}")
@@ -559,7 +620,7 @@ if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     muon_step_newton_schulz_fused = torch.compile(muon_step_newton_schulz_fused, dynamic=False, fullgraph=True)
     muon_step_adhoc_fused = torch.compile(muon_step_adhoc_fused, dynamic=False, fullgraph=True)
     muon_step_adaptive_poly_fused = torch.compile(muon_step_adaptive_poly_fused, dynamic=False, fullgraph=True)
-    muon_step_adaptive_greedy_fused = torch.compile(muon_step_adaptive_greedy_fused, dynamic=False, fullgraph=True)
+    muon_step_gso_fused = torch.compile(muon_step_gso_fused, dynamic=False, fullgraph=True)
 
 
 # -----------------------------------------------------------------------------
@@ -577,7 +638,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization',
               'muon_norm_iters', 'ortho_order', 'ortho_grid', 'ortho_newton',
-              'orthogonalization_dtype', 'beta2', 'weight_decay'
+              'orthogonalization_dtype', 'beta2', 'weight_decay'. adaptive_poly
+              uses error-basis FO/SO depending on ortho_order; gso uses greedy
+              second-order error-basis APO.
     """
 
     def __init__(self, param_groups: list[dict]):
