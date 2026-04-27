@@ -5,6 +5,8 @@ mkdir -p logs
 
 COMMON_ARGS=(
   --muon-orthogonalization-dtype=bfloat16
+  --eval-every=50
+  --eval-tokens=524288*2
 )
 
 if [[ -n "${NUM_ITERATIONS:-}" ]]; then
@@ -56,16 +58,16 @@ run_method newton_schulz_1 \
   --muon-norm-iters=1 \
   --print-every=1
 
-run_method newton_schulz_2 \
+run_method muon_adhoc \
   --core-metric-every=-1 \
   --depth=14 \
   --window-pattern=L \
   --sample-every=-1 \
   --save-every=-1 \
   --run=dummy \
-  --muon-orthogonalization=newton_schulz \
-  --model-tag=newton_schulz_2 \
-  --ortho-order=2 \
+  --muon-orthogonalization=muon_adhoc \
+  --model-tag=muon_adhoc \
+  --ortho-order=1 \
   --ns-steps=5 \
   --muon-norm-iters=1 \
   --print-every=1
