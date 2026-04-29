@@ -59,6 +59,20 @@ def test_adaptive_poly_first_order_beta_near_identity_is_near_half():
     assert torch.allclose(beta, torch.full_like(beta, 0.5), atol=0.03)
 
 
+def test_gso_fixed_gamma_beta_is_finite_for_batch():
+    x = torch.randn(2, 5, 3) * 0.2
+    g = x.mT @ x
+    eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
+    e = eye - g
+    moments = optim._error_moments(e, 10)
+    gamma = torch.full(x.shape[:-2], 0.375, dtype=x.dtype, device=x.device)
+
+    beta = optim._optimal_beta_with_fixed_gamma_from_error_moments(moments, gamma, 0.0, 2.0, 17, 2)
+
+    assert beta.shape == gamma.shape
+    assert torch.isfinite(beta).all()
+
+
 def test_adaptive_poly_second_order_gamma_fixed_matches_quintic_newton_schulz():
     x = torch.randn(2, 5, 3) * 0.2
     g = x.mT @ x
@@ -75,20 +89,24 @@ def test_adaptive_poly_second_order_gamma_fixed_matches_quintic_newton_schulz():
 
 def test_gso_step_uses_beta_for_e_and_gamma_for_e_squared(monkeypatch):
     x = torch.randn(2, 5, 3) * 0.2
+    gamma_prev = torch.full((2,), 0.375)
     beta_value = torch.full((2,), 0.25)
     gamma_value = torch.full((2,), 0.125)
 
-    def fake_beta(moments, beta_min, beta_max, ortho_grid, ortho_newton):
+    def fake_beta(moments, gamma, beta_min, beta_max, ortho_grid, ortho_newton):
+        assert torch.equal(gamma, gamma_prev.to(dtype=gamma.dtype, device=gamma.device))
         return beta_value.to(dtype=moments[0].dtype, device=moments[0].device)
 
     def fake_gamma(moments, beta, gamma_min, gamma_max, ortho_grid, ortho_newton):
         assert torch.equal(beta, beta_value.to(dtype=beta.dtype, device=beta.device))
+        assert gamma_min == 0.0
+        assert gamma_max == 1.5
         return gamma_value.to(dtype=moments[0].dtype, device=moments[0].device)
 
-    monkeypatch.setattr(optim, "_optimal_beta_first_order_from_error_moments", fake_beta)
+    monkeypatch.setattr(optim, "_optimal_beta_with_fixed_gamma_from_error_moments", fake_beta)
     monkeypatch.setattr(optim, "_optimal_gamma_with_fixed_beta_from_error_moments", fake_gamma)
 
-    actual = optim._gso_error_step(x, 17, 2)
+    actual, gamma = optim._gso_error_step(x, gamma_prev, 17, 2)
 
     g = x.mT @ x
     eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
@@ -97,6 +115,7 @@ def test_gso_step_uses_beta_for_e_and_gamma_for_e_squared(monkeypatch):
     expected = x @ (eye + beta_value[..., None, None] * e + gamma_value[..., None, None] * e2)
 
     assert torch.allclose(actual, expected)
+    assert torch.equal(gamma, gamma_value.to(dtype=gamma.dtype, device=gamma.device))
 
 
 @pytest.mark.parametrize(("orthogonalization", "step_name"), [
@@ -108,9 +127,9 @@ def test_muon_norm_iters_reaches_adaptive_methods(monkeypatch, orthogonalization
     captured_norms = []
     original_step = getattr(optim, step_name)
 
-    def wrapped_step(x, ortho_grid, ortho_newton):
+    def wrapped_step(x, *args):
         captured_norms.append(x.norm(dim=(-2, -1)).detach().clone())
-        return original_step(x, ortho_grid, ortho_newton)
+        return original_step(x, *args)
 
     monkeypatch.setattr(optim, step_name, wrapped_step)
 

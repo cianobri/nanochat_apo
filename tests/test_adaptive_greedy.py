@@ -7,6 +7,7 @@ os.environ["NANOCHAT_DISABLE_COMPILE"] = "1"
 import pytest
 import torch
 
+import nanochat.optim as optim
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.optim import MuonAdamW
 
@@ -55,6 +56,10 @@ def test_gpt_setup_optimizer_accepts_gso():
     muon_groups = [group for group in optimizer.param_groups if group["kind"] == "muon"]
     assert muon_groups
     assert all(group["orthogonalization"] == "gso" for group in muon_groups)
+
+
+def test_adaptive_greedy_routes_to_gso_function():
+    assert optim._get_muon_step_fn({"orthogonalization": "adaptive_greedy"}) is optim.muon_step_gso_fused
 
 
 @pytest.mark.parametrize("ns_steps", [1, 2])

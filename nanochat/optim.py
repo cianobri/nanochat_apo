@@ -427,6 +427,39 @@ def _optimal_gamma_with_fixed_beta_from_error_moments(
     )
 
 
+def _optimal_beta_with_fixed_gamma_from_error_moments(
+    moments: list[Tensor],
+    gamma: Tensor,
+    beta_min: float,
+    beta_max: float,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> Tensor:
+    zero = torch.zeros_like(gamma)
+    one = torch.ones_like(gamma)
+    gamma2 = gamma.square()
+    r_terms: list[tuple[Tensor, Tensor, Tensor]] = [
+        (one, -2.0 * one, zero),
+        (-2.0 * gamma, 2.0 * one, -1.0 * one),
+        (2.0 * gamma, -2.0 * gamma, one),
+        (-gamma2, 2.0 * gamma, zero),
+        (gamma2, zero, zero),
+    ]
+    coeffs = [torch.zeros_like(gamma) for _ in range(5)]
+    for i, (ai, bi, ci) in enumerate(r_terms, start=1):
+        for j, (aj, bj, cj) in enumerate(r_terms, start=1):
+            moment = moments[i + j]
+            coeffs[0] = coeffs[0] + ai * aj * moment
+            coeffs[1] = coeffs[1] + (ai * bj + bi * aj) * moment
+            coeffs[2] = coeffs[2] + (ai * cj + bi * bj + ci * aj) * moment
+            coeffs[3] = coeffs[3] + (bi * cj + ci * bj) * moment
+            coeffs[4] = coeffs[4] + ci * cj * moment
+    return _quartic_minimizer_on_interval(
+        coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
+        beta_min, beta_max, ortho_grid, ortho_newton,
+    )
+
+
 def _adaptive_poly_first_order_error_step(x: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
     g = x.mT @ x
     eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
@@ -446,15 +479,41 @@ def _adaptive_poly_second_order_error_step(x: Tensor, ortho_grid: int, ortho_new
     return x @ (eye + 0.5 * e + gamma[..., None, None] * e2)
 
 
-def _gso_error_step(x: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
+def _gso_error_step(
+    x: Tensor,
+    gamma_prev: Tensor,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> tuple[Tensor, Tensor]:
+    """
+    GSO error-basis update X_next = X @ (I + beta E + gamma E^2).
+
+    beta is optimized with gamma fixed to previous gamma; gamma is then
+    optimized with beta fixed.
+    """
     g = x.mT @ x
     eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
     e = eye - g
     e2 = e @ e
     moments = _error_moments(e, 10)
-    beta = _optimal_beta_first_order_from_error_moments(moments, 0.0, 2.0, ortho_grid, ortho_newton)
-    gamma = _optimal_gamma_with_fixed_beta_from_error_moments(moments, beta, 0.0, 0.8, ortho_grid, ortho_newton)
-    return x @ (eye + beta[..., None, None] * e + gamma[..., None, None] * e2)
+    beta = _optimal_beta_with_fixed_gamma_from_error_moments(
+        moments,
+        gamma_prev,
+        0.0,
+        2.0,
+        ortho_grid,
+        ortho_newton,
+    )
+    gamma = _optimal_gamma_with_fixed_beta_from_error_moments(
+        moments,
+        beta,
+        0.0,
+        1.5,
+        ortho_grid,
+        ortho_newton,
+    )
+    x = x @ (eye + beta[..., None, None] * e + gamma[..., None, None] * e2)
+    return x, gamma
 
 
 def muon_step_adaptive_poly_fused(
@@ -524,8 +583,13 @@ def muon_step_gso_fused(
     ortho_dtype_code: int,
 ) -> None:
     """
-    Fused Muon step: momentum -> greedy second-order error-basis adaptive polynomial
-    -> variance_reduction -> cautious_update.
+    Fused Muon step: momentum -> previous-gamma GSO -> variance_reduction
+    -> cautious_update.
+
+    GSO uses error-basis update X_next = X @ (I + beta E + gamma E^2).
+    beta is optimized with gamma fixed to previous gamma, initialized to 3/8
+    at the start of each Muon orthogonalization call. gamma is then optimized
+    with beta fixed.
     """
 
     momentum = momentum_t.to(stacked_grads.dtype)
@@ -539,8 +603,14 @@ def muon_step_gso_fused(
     if transposed:
         X = X.mT
 
+    gamma_prev = torch.full(
+        X.shape[:-2],
+        0.375,
+        dtype=X.dtype,
+        device=X.device,
+    )
     for _ in range(ns_steps):
-        X = _gso_error_step(X, ortho_grid, ortho_newton)
+        X, gamma_prev = _gso_error_step(X, gamma_prev, ortho_grid, ortho_newton)
 
     if transposed:
         X = X.mT
@@ -639,8 +709,8 @@ class MuonAdamW(torch.optim.Optimizer):
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization',
               'muon_norm_iters', 'ortho_order', 'ortho_grid', 'ortho_newton',
               'orthogonalization_dtype', 'beta2', 'weight_decay'. adaptive_poly
-              uses error-basis FO/SO depending on ortho_order; gso uses greedy
-              second-order error-basis APO.
+              uses error-basis FO/SO depending on ortho_order; gso uses
+              previous-gamma second-order error-basis APO.
     """
 
     def __init__(self, param_groups: list[dict]):
