@@ -5,8 +5,8 @@ mkdir -p logs
 
 COMMON_ARGS=(
   --muon-orthogonalization-dtype=bfloat16
-  --eval-every=50
-  --eval-tokens=524288*2
+  --eval-every=40
+  --eval-tokens=524288
 )
 
 if [[ -n "${NUM_ITERATIONS:-}" ]]; then
