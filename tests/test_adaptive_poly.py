@@ -120,6 +120,7 @@ def test_gso_step_uses_beta_for_e_and_gamma_for_e_squared(monkeypatch):
 
 @pytest.mark.parametrize(("orthogonalization", "step_name"), [
     ("adaptive_poly", "_adaptive_poly_first_order_error_step"),
+    ("ls2", "_ls2_error_step"),
     ("gso", "_gso_error_step"),
 ])
 @pytest.mark.parametrize("muon_norm_iters", [False, True])

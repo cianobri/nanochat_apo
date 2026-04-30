@@ -516,6 +516,40 @@ def _gso_error_step(
     return x, gamma
 
 
+def _ls2_error_step(
+    x: Tensor,
+    damping: float = 1e-12,
+) -> Tensor:
+    """
+    Linearized residual least-squares second-order error-basis update:
+    X_next = X @ (I + beta E + gamma E^2).
+    """
+    g = x.mT @ x
+    eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
+    e = eye - g
+    e2 = e @ e
+
+    a1 = g @ e + e @ g
+    a2 = g @ e2 + e2 @ g
+
+    h00 = (a1 * a1).sum(dim=(-2, -1))
+    h01 = (a1 * a2).sum(dim=(-2, -1))
+    h11 = (a2 * a2).sum(dim=(-2, -1))
+
+    b0 = (e * a1).sum(dim=(-2, -1))
+    b1 = (e * a2).sum(dim=(-2, -1))
+
+    h00_damped = h00 + damping
+    h11_damped = h11 + damping
+    det = h00_damped * h11_damped - h01 * h01
+    det = det.clamp_min(1e-30)
+
+    beta = (h11_damped * b0 - h01 * b1) / det
+    gamma = (h00_damped * b1 - h01 * b0) / det
+
+    return x @ (eye + beta[..., None, None] * e + gamma[..., None, None] * e2)
+
+
 def muon_step_adaptive_poly_fused(
     stacked_grads: Tensor,
     stacked_params: Tensor,
@@ -558,6 +592,48 @@ def muon_step_adaptive_poly_fused(
             X = _adaptive_poly_second_order_error_step(X, ortho_grid, ortho_newton)
         else:
             raise ValueError(f"ortho_order must be 1 or 2, got {ortho_order}")
+
+    if transposed:
+        X = X.mT
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
+
+
+def muon_step_ls2_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+    muon_norm_iters: bool,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
+    ortho_dtype_code: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> LS2 linearized residual least-squares
+    error-basis orthogonalization -> variance_reduction -> cautious_update.
+    """
+
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
+    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+
+    transposed = g.size(-2) <= g.size(-1)
+    if transposed:
+        X = X.mT
+
+    for _ in range(ns_steps):
+        X = _ls2_error_step(X)
 
     if transposed:
         X = X.mT
@@ -667,6 +743,8 @@ def _get_muon_step_fn(group: dict):
         return muon_step_newton_schulz_fused
     if orthogonalization == "adaptive_poly":
         return muon_step_adaptive_poly_fused
+    if orthogonalization == "ls2":
+        return muon_step_ls2_fused
     if orthogonalization == "gso":
         return muon_step_gso_fused
     if orthogonalization == "adaptive_greedy":
@@ -690,6 +768,7 @@ if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     muon_step_newton_schulz_fused = torch.compile(muon_step_newton_schulz_fused, dynamic=False, fullgraph=True)
     muon_step_adhoc_fused = torch.compile(muon_step_adhoc_fused, dynamic=False, fullgraph=True)
     muon_step_adaptive_poly_fused = torch.compile(muon_step_adaptive_poly_fused, dynamic=False, fullgraph=True)
+    muon_step_ls2_fused = torch.compile(muon_step_ls2_fused, dynamic=False, fullgraph=True)
     muon_step_gso_fused = torch.compile(muon_step_gso_fused, dynamic=False, fullgraph=True)
 
 
@@ -710,7 +789,9 @@ class MuonAdamW(torch.optim.Optimizer):
               'muon_norm_iters', 'ortho_order', 'ortho_grid', 'ortho_newton',
               'orthogonalization_dtype', 'beta2', 'weight_decay'. adaptive_poly
               uses error-basis FO/SO depending on ortho_order; gso uses
-              previous-gamma second-order error-basis APO.
+              previous-gamma second-order error-basis APO; ls2 uses a
+              linearized residual least-squares solve in the error basis:
+              X_next = X @ (I + beta E + gamma E^2).
     """
 
     def __init__(self, param_groups: list[dict]):
