@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd /workspace/nanochat_apo
+
 export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
+export TMPDIR=/workspace/pip_tmp
+export PIP_CACHE_DIR=/workspace/pip_cache
+
 PYTHON_BIN=/workspace/nanochat_apo/.venv/bin/python
 
-mkdir -p logs
+mkdir -p logs "$TMPDIR" "$PIP_CACHE_DIR"
 
 "$PYTHON_BIN" - <<'PY'
 import torch
@@ -37,6 +42,8 @@ run_method () {
   echo "================================================="
   echo "STARTING: $name"
   echo "TIME: $(date)"
+  echo "PYTHON: $PYTHON_BIN"
+  echo "NANOCHAT_BASE_DIR: $NANOCHAT_BASE_DIR"
   echo "EXTRA COMMON ARGS: ${COMMON_ARGS[*]:-<none>}"
   echo "================================================="
 
@@ -63,19 +70,6 @@ run_method newton_schulz_2 \
   --muon-norm-iters=1 \
   --print-every=1
 
-run_method ls2 \
-  --core-metric-every=-1 \
-  --depth=14 \
-  --window-pattern=L \
-  --sample-every=-1 \
-  --save-every=-1 \
-  --run=dummy \
-  --muon-orthogonalization=ls2 \
-  --model-tag=ls2 \
-  --ns-steps=5 \
-  --muon-norm-iters=1 \
-  --print-every=1
-
 run_method gso \
   --core-metric-every=-1 \
   --depth=14 \
@@ -85,6 +79,19 @@ run_method gso \
   --run=dummy \
   --muon-orthogonalization=gso \
   --model-tag=gso \
+  --ns-steps=5 \
+  --muon-norm-iters=1 \
+  --print-every=1
+
+run_method ls2 \
+  --core-metric-every=-1 \
+  --depth=14 \
+  --window-pattern=L \
+  --sample-every=-1 \
+  --save-every=-1 \
+  --run=dummy \
+  --muon-orthogonalization=ls2 \
+  --model-tag=ls2 \
   --ns-steps=5 \
   --muon-norm-iters=1 \
   --print-every=1

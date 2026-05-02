@@ -1,7 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+cd /workspace/nanochat_apo
+
 export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
-mkdir -p logs
+export TMPDIR=/workspace/pip_tmp
+export PIP_CACHE_DIR=/workspace/pip_cache
+
+PYTHON_BIN=/workspace/nanochat_apo/.venv/bin/python
+
+mkdir -p logs "$TMPDIR" "$PIP_CACHE_DIR"
+
+"$PYTHON_BIN" - <<'PY'
+import torch
+from nanochat.common import get_base_dir
+from nanochat.dataset import list_parquet_files
+
+paths = list_parquet_files()
+print("Python/Torch OK")
+print("torch:", torch.__version__, "cuda:", torch.cuda.is_available())
+print("base_dir:", get_base_dir())
+print("dataset files:", len(paths))
+print("train files:", len(paths)-1)
+print("val:", paths[-1])
+PY
 
 COMMON_ARGS=(
   --core-metric-every=-1
@@ -27,11 +49,13 @@ run_method () {
   echo "================================================="
   echo "STARTING: ${name}"
   echo "TIME: $(date)"
+  echo "PYTHON: $PYTHON_BIN"
+  echo "NANOCHAT_BASE_DIR: $NANOCHAT_BASE_DIR"
   echo "COMMON_ARGS: ${COMMON_ARGS[*]}"
   echo "METHOD_ARGS: $*"
   echo "================================================="
 
-  PYTHONUNBUFFERED=1 python -m scripts.base_train \
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m scripts.base_train \
     "${COMMON_ARGS[@]}" \
     "$@" \
     2>&1 | tee "logs/${name}.log"
@@ -72,7 +96,6 @@ run_method ns_raw \
 
 # -------------------------------------------------
 # FO-APO, normalized and raw
-# Matmul-matched-ish to PE T=5: FO-APO T=2
 # -------------------------------------------------
 
 run_method apo1_norm \
@@ -89,7 +112,6 @@ run_method apo1_raw \
 
 # -------------------------------------------------
 # SO-APO, normalized and raw
-# Matmul-matched-ish to PE T=5: SO-APO T=1
 # -------------------------------------------------
 
 run_method apo2_norm \

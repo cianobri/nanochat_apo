@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p logs
+cd /workspace/nanochat_apo
+
 export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
+export TMPDIR=/workspace/pip_tmp
+export PIP_CACHE_DIR=/workspace/pip_cache
+
+PYTHON_BIN=/workspace/nanochat_apo/.venv/bin/python
+
+mkdir -p logs "$TMPDIR" "$PIP_CACHE_DIR"
+
+"$PYTHON_BIN" - <<'PY'
+import torch
+from nanochat.common import get_base_dir
+from nanochat.dataset import list_parquet_files
+
+paths = list_parquet_files()
+print("Python/Torch OK")
+print("torch:", torch.__version__, "cuda:", torch.cuda.is_available())
+print("base_dir:", get_base_dir())
+print("dataset files:", len(paths))
+print("train files:", len(paths)-1)
+print("val:", paths[-1])
+PY
+
 COMMON_ARGS=(
   --muon-orthogonalization-dtype=bfloat16
   --eval-every=40
@@ -20,10 +42,12 @@ run_method () {
   echo "================================================="
   echo "STARTING: $name"
   echo "TIME: $(date)"
+  echo "PYTHON: $PYTHON_BIN"
+  echo "NANOCHAT_BASE_DIR: $NANOCHAT_BASE_DIR"
   echo "EXTRA COMMON ARGS: ${COMMON_ARGS[*]:-<none>}"
   echo "================================================="
 
-  PYTHONUNBUFFERED=1 python -m scripts.base_train "$@" "${COMMON_ARGS[@]}" \
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m scripts.base_train "$@" "${COMMON_ARGS[@]}" \
     2>&1 | tee "logs/${name}.log"
 
   echo "================================================="
@@ -124,4 +148,3 @@ run_method adamW \
   --run=dummy \
   --model-tag=adamW \
   --print-every=1
-
