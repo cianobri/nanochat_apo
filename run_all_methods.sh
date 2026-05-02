@@ -2,7 +2,7 @@
 set -euo pipefail
 
 mkdir -p logs
-
+export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
 COMMON_ARGS=(
   --muon-orthogonalization-dtype=bfloat16
   --eval-every=40

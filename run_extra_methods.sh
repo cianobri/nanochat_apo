@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
 mkdir -p logs
 
 COMMON_ARGS=(
