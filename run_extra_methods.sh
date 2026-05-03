@@ -83,6 +83,32 @@ run_method gso \
   --muon-norm-iters=1 \
   --print-every=1
 
+run_method polar_express \
+  --core-metric-every=-1 \
+  --depth=14 \
+  --window-pattern=L \
+  --sample-every=-1 \
+  --save-every=-1 \
+  --run=dummy \
+  --muon-orthogonalization=polar_express \
+  --model-tag=polar_express \
+  --ns-steps=5 \
+  --print-every=1
+
+run_method muon_adhoc \
+  --core-metric-every=-1 \
+  --depth=14 \
+  --window-pattern=L \
+  --sample-every=-1 \
+  --save-every=-1 \
+  --run=dummy \
+  --muon-orthogonalization=muon_adhoc \
+  --model-tag=muon_adhoc \
+  --ortho-order=1 \
+  --ns-steps=5 \
+  --muon-norm-iters=1 \
+  --print-every=1
+
 run_method ls2 \
   --core-metric-every=-1 \
   --depth=14 \
