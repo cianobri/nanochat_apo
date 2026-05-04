@@ -95,12 +95,14 @@ def test_gso_step_uses_beta_for_e_and_gamma_for_e_squared(monkeypatch):
 
     def fake_beta(moments, gamma, beta_min, beta_max, ortho_grid, ortho_newton):
         assert torch.equal(gamma, gamma_prev.to(dtype=gamma.dtype, device=gamma.device))
+        assert beta_min == 0.0
+        assert beta_max == 1.0
         return beta_value.to(dtype=moments[0].dtype, device=moments[0].device)
 
     def fake_gamma(moments, beta, gamma_min, gamma_max, ortho_grid, ortho_newton):
         assert torch.equal(beta, beta_value.to(dtype=beta.dtype, device=beta.device))
         assert gamma_min == 0.0
-        assert gamma_max == 1.5
+        assert gamma_max == 0.8
         return gamma_value.to(dtype=moments[0].dtype, device=moments[0].device)
 
     monkeypatch.setattr(optim, "_optimal_beta_with_fixed_gamma_from_error_moments", fake_beta)

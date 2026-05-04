@@ -500,7 +500,7 @@ def _gso_error_step(
         moments,
         gamma_prev,
         0.0,
-        2.0,
+        1.0,
         ortho_grid,
         ortho_newton,
     )
@@ -508,7 +508,7 @@ def _gso_error_step(
         moments,
         beta,
         0.0,
-        1.5,
+        0.8,
         ortho_grid,
         ortho_newton,
     )
@@ -518,7 +518,7 @@ def _gso_error_step(
 
 def _ls2_error_step(
     x: Tensor,
-    damping: float = 1e-12,
+    tikhonov: float = 1e-4,
 ) -> Tensor:
     """
     Linearized residual least-squares second-order error-basis update:
@@ -539,8 +539,9 @@ def _ls2_error_step(
     b0 = (e * a1).sum(dim=(-2, -1))
     b1 = (e * a2).sum(dim=(-2, -1))
 
-    h00_damped = h00 + damping
-    h11_damped = h11 + damping
+    ridge = tikhonov * 0.5 * (h00 + h11).clamp_min(1e-30)
+    h00_damped = h00 + ridge
+    h11_damped = h11 + ridge
     det = h00_damped * h11_damped - h01 * h01
     det = det.clamp_min(1e-30)
 

@@ -26,7 +26,7 @@ print("val:", paths[-1])
 PY
 
 COMMON_ARGS=(
-  --muon-orthogonalization-dtype=bfloat16
+  --muon-orthogonalization-dtype=float32
   --eval-every=40
   --eval-tokens=524288
 )

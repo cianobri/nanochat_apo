@@ -24,6 +24,17 @@ def test_ls2_error_step_runs_for_stacked_batch():
     assert torch.isfinite(actual).all()
 
 
+def test_ls2_tikhonov_regularization_affects_solution():
+    torch.manual_seed(0)
+    x = torch.randn(3, 5, 2) * 0.2
+
+    unregularized = optim._ls2_error_step(x, tikhonov=0.0)
+    regularized = optim._ls2_error_step(x, tikhonov=1e-1)
+
+    assert torch.isfinite(regularized).all()
+    assert not torch.allclose(unregularized, regularized)
+
+
 @pytest.mark.parametrize("shape", [(5, 2), (2, 5)])
 def test_ls2_step_updates_params_and_preserves_shape(shape):
     torch.manual_seed(1)
