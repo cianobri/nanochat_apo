@@ -27,14 +27,11 @@ PY
 
 COMMON_ARGS=(
   --muon-orthogonalization-dtype=float32
-  --eval-every=40
+  --eval-every=10
   --eval-tokens=524288
+  --num-iterations=100
   --verbose-log
 )
-
-if [[ -n "${NUM_ITERATIONS:-}" ]]; then
-  COMMON_ARGS+=(--num-iterations="${NUM_ITERATIONS}")
-fi
 
 run_method () {
   local name="$1"
@@ -65,25 +62,42 @@ BASE_ARGS=(
   --sample-every=-1
   --save-every=-1
   --run=dummy
-  --muon-orthogonalization=gso
-  --model-tag=gso
   --ns-steps=5
   --print-every=1
 )
 
-run_method gso_no_norm \
-  "${BASE_ARGS[@]}" \
-  --model-tag=gso_no_norm \
-  --muon-norm-iters=0
+LRS=(0.01 0.02 0.025 0.03 0.04)
 
-run_method gso_frob_norm \
-  "${BASE_ARGS[@]}" \
-  --model-tag=gso_frob_norm \
-  --muon-norm-iters=1 \
-  --muon-normalization=frobenius
+for LR in "${LRS[@]}"; do
+  LR_TAG="${LR//./p}"
 
-run_method gso_opt_norm \
-  "${BASE_ARGS[@]}" \
-  --model-tag=gso_opt_norm \
-  --muon-norm-iters=1 \
-  --muon-normalization=opt
+  run_method "polar_express_lr${LR_TAG}" \
+    "${BASE_ARGS[@]}" \
+    --muon-orthogonalization=polar_express \
+    --model-tag="polar_express_lr${LR_TAG}" \
+    --matrix-lr="${LR}"
+
+  run_method "gso_lr${LR_TAG}" \
+    "${BASE_ARGS[@]}" \
+    --muon-orthogonalization=gso \
+    --model-tag="gso_lr${LR_TAG}" \
+    --muon-norm-iters=1 \
+    --matrix-lr="${LR}"
+
+  run_method "muon_adhoc_lr${LR_TAG}" \
+    "${BASE_ARGS[@]}" \
+    --muon-orthogonalization=muon_adhoc \
+    --model-tag="muon_adhoc_lr${LR_TAG}" \
+    --ortho-order=1 \
+    --muon-norm-iters=1 \
+    --matrix-lr="${LR}"
+
+  run_method "newton_schulz_2_lr${LR_TAG}" \
+    "${BASE_ARGS[@]}" \
+    --muon-orthogonalization=newton_schulz \
+    --model-tag="newton_schulz_2_lr${LR_TAG}" \
+    --ortho-order=2 \
+    --muon-norm-iters=1 \
+    --matrix-lr="${LR}"
+
+done
