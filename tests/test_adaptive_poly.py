@@ -152,3 +152,25 @@ def test_muon_norm_iters_reaches_adaptive_methods(monkeypatch, orthogonalization
     assert len(captured_norms) == 1
     expected_norm = torch.ones_like(captured_norms[0]) if muon_norm_iters else p.grad.norm(dim=(-2, -1))
     assert torch.allclose(captured_norms[0], expected_norm, atol=1e-5, rtol=1e-5)
+
+
+def test_muon_opt_normalization_matches_trace_ratio():
+    x = torch.tensor([[[3.0, 0.0], [0.0, 4.0]]])
+    actual = optim._maybe_normalize_muon_orthogonalization_input(
+        x,
+        optim._MUON_NORMALIZATION_CODES["opt"],
+    )
+    gram = x.mT @ x
+    scale = (x.square().sum(dim=(-2, -1), keepdim=True) / gram.square().sum(dim=(-2, -1), keepdim=True)).sqrt()
+    assert torch.allclose(actual, x * scale)
+
+
+def test_muon_opt_normalization_uses_same_scale_for_wide_matrices():
+    x = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]])
+    actual = optim._maybe_normalize_muon_orthogonalization_input(
+        x,
+        optim._MUON_NORMALIZATION_CODES["opt"],
+    )
+    gram = x.mT @ x
+    scale = (x.square().sum(dim=(-2, -1), keepdim=True) / gram.square().sum(dim=(-2, -1), keepdim=True)).sqrt()
+    assert torch.allclose(actual, x * scale)

@@ -81,6 +81,12 @@ _MUON_ORTHO_DTYPE_CODES = {
     "float16": 3,
 }
 
+_MUON_NORMALIZATION_CODES = {
+    "none": 0,
+    "frobenius": 1,
+    "opt": 2,
+}
+
 
 def _get_muon_orthogonalization_dtype_code(group: dict) -> int:
     dtype_name = group.get("orthogonalization_dtype", "float32")
@@ -88,6 +94,16 @@ def _get_muon_orthogonalization_dtype_code(group: dict) -> int:
         choices = ", ".join(_MUON_ORTHO_DTYPE_CODES)
         raise ValueError(f"Unknown Muon orthogonalization dtype: {dtype_name} (choices: {choices})")
     return _MUON_ORTHO_DTYPE_CODES[dtype_name]
+
+
+def _get_muon_normalization_code(group: dict) -> int:
+    if not bool(group.get("muon_norm_iters", True)):
+        return _MUON_NORMALIZATION_CODES["none"]
+    normalization = group.get("muon_normalization", "frobenius")
+    if normalization not in _MUON_NORMALIZATION_CODES:
+        choices = ", ".join(k for k in _MUON_NORMALIZATION_CODES if k != "none")
+        raise ValueError(f"Unknown Muon normalization strategy: {normalization} (choices: {choices})")
+    return _MUON_NORMALIZATION_CODES[normalization]
 
 
 def _cast_muon_orthogonalization_input(g: Tensor, dtype_code: int) -> Tensor:
@@ -102,10 +118,24 @@ def _cast_muon_orthogonalization_input(g: Tensor, dtype_code: int) -> Tensor:
     raise ValueError(f"Unknown Muon orthogonalization dtype code: {dtype_code}")
 
 
-def _maybe_normalize_muon_orthogonalization_input(x: Tensor, muon_norm_iters: bool) -> Tensor:
-    if muon_norm_iters:
+def _maybe_normalize_muon_orthogonalization_input(x: Tensor, normalization_code: int) -> Tensor:
+    if normalization_code == _MUON_NORMALIZATION_CODES["none"]:
+        return x
+    if normalization_code == _MUON_NORMALIZATION_CODES["frobenius"]:
         return x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-6)
-    return x
+    if normalization_code == _MUON_NORMALIZATION_CODES["opt"]:
+        # scale = sqrt(tr(X^T X) / tr((X^T X)^2)). For wide matrices, use
+        # X X^T, which has the same non-zero eigenvalues and a smaller Gram.
+        x_float = x.float()
+        if x.size(-2) >= x.size(-1):
+            gram = x_float.mT @ x_float
+        else:
+            gram = x_float @ x_float.mT
+        trace = x_float.square().sum(dim=(-2, -1), keepdim=True)
+        trace_gram_sq = gram.square().sum(dim=(-2, -1), keepdim=True)
+        scale = (trace / trace_gram_sq.clamp_min(1e-30)).sqrt()
+        return x * scale.to(dtype=x.dtype)
+    raise ValueError(f"Unknown Muon normalization code: {normalization_code}")
 
 
 def _finish_muon_step(
@@ -152,7 +182,7 @@ def muon_step_polar_express_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -172,7 +202,7 @@ def muon_step_polar_express_fused(
 
     # Polar Express
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
 
     if g.size(-2) > g.size(-1):  # Tall matrix
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -199,7 +229,7 @@ def muon_step_newton_schulz_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -219,7 +249,7 @@ def muon_step_newton_schulz_fused(
 
     # Newton-Schulz iteration for the zeroth power / orthogonalized update.
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
 
     if g.size(-2) > g.size(-1):  # Tall matrix
         for _ in range(ns_steps):
@@ -256,7 +286,7 @@ def muon_step_adhoc_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -273,7 +303,7 @@ def muon_step_adhoc_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
 
     a, b, c = muon_adhoc_coeffs
     if g.size(-2) > g.size(-1):  # Tall matrix
@@ -460,6 +490,103 @@ def _optimal_beta_with_fixed_gamma_from_error_moments(
     )
 
 
+def _poly_convolve(a: list[Tensor], b: list[Tensor]) -> list[Tensor]:
+    out = [torch.zeros_like(a[0]) for _ in range(len(a) + len(b) - 1)]
+    for i, ai in enumerate(a):
+        for j, bj in enumerate(b):
+            out[i + j] = out[i + j] + ai * bj
+    return out
+
+
+def _moment_polynomial_expectation(coeffs: list[Tensor], moments: list[Tensor]) -> Tensor:
+    value = torch.zeros_like(moments[0])
+    for k, coeff in enumerate(coeffs):
+        value = value + coeff * moments[k]
+    return value
+
+
+def _unanchored_gram_objective_from_coeffs(coeffs: list[Tensor], moments: list[Tensor]) -> Tensor:
+    p2 = _poly_convolve(coeffs, coeffs)
+    p4 = _poly_convolve(p2, p2)
+
+    lambda1 = [torch.ones_like(coeffs[0]), -torch.ones_like(coeffs[0])]
+    lambda2 = [torch.ones_like(coeffs[0]), -2.0 * torch.ones_like(coeffs[0]), torch.ones_like(coeffs[0])]
+    denominator_poly = _poly_convolve(lambda1, p2)
+    numerator_poly = _poly_convolve(lambda2, p4)
+
+    denominator = _moment_polynomial_expectation(denominator_poly, moments)
+    numerator = _moment_polynomial_expectation(numerator_poly, moments)
+    return numerator / denominator.clamp_min(1e-30).square()
+
+
+def _optimal_unanchored_gram_coordinate_from_error_moments(
+    moments: list[Tensor],
+    alpha: Tensor,
+    beta: Tensor,
+    gamma: Tensor,
+    index: int,
+    coeff_min: float,
+    coeff_max: float,
+    ortho_grid: int,
+) -> Tensor:
+    """
+    Bounded coordinate minimizer for the unanchored Gram objective.
+
+    The NumPy prototype uses exact roots of the rational objective's stationary
+    polynomial. This Torch path uses a fixed grid so it stays simple, batched,
+    device-native, and friendly to torch.compile.
+    """
+    coeffs = [alpha, beta, gamma]
+    best = coeffs[index]
+    best_value = _unanchored_gram_objective_from_coeffs(coeffs, moments)
+
+    delta = (coeff_max - coeff_min) / float(ortho_grid - 1)
+    for i in range(ortho_grid):
+        candidate = torch.full_like(best, coeff_min + delta * i)
+        trial_coeffs = [alpha, beta, gamma]
+        trial_coeffs[index] = candidate
+        value = _unanchored_gram_objective_from_coeffs(trial_coeffs, moments)
+        take_candidate = value < best_value
+        best = torch.where(take_candidate, candidate, best)
+        best_value = torch.where(take_candidate, value, best_value)
+
+    return best
+
+
+def _uagq_error_step(
+    x: Tensor,
+    ortho_grid: int,
+    ortho_newton: int,
+) -> Tensor:
+    """
+    Unanchored Gram quintic update:
+        X_next = X @ (I + beta E + gamma E^2)
+
+    This minimizes corrected Gram spectral spread up to scale, with alpha fixed
+    to 1 as the gauge. `ortho_newton` controls beta/gamma coordinate sweeps.
+    """
+    g = x.mT @ x
+    eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
+    e = eye - g
+    moments = _error_moments(e, 10)
+
+    alpha = torch.ones(x.shape[:-2], dtype=x.dtype, device=x.device)
+    beta = torch.full(x.shape[:-2], 0.5, dtype=x.dtype, device=x.device)
+    gamma = torch.full(x.shape[:-2], 0.375, dtype=x.dtype, device=x.device)
+
+    num_sweeps = max(1, ortho_newton)
+    for _ in range(num_sweeps):
+        beta = _optimal_unanchored_gram_coordinate_from_error_moments(
+            moments, alpha, beta, gamma, 1, -2.0, 2.0, ortho_grid,
+        )
+        gamma = _optimal_unanchored_gram_coordinate_from_error_moments(
+            moments, alpha, beta, gamma, 2, -2.0, 2.0, ortho_grid,
+        )
+
+    e2 = e @ e
+    return x @ (eye + beta[..., None, None] * e + gamma[..., None, None] * e2)
+
+
 def _adaptive_poly_first_order_error_step(x: Tensor, ortho_grid: int, ortho_newton: int) -> Tensor:
     g = x.mT @ x
     eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
@@ -562,7 +689,7 @@ def muon_step_adaptive_poly_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -580,7 +707,7 @@ def muon_step_adaptive_poly_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
 
     transposed = g.size(-2) <= g.size(-1)
     if transposed:
@@ -611,7 +738,7 @@ def muon_step_ls2_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -627,7 +754,7 @@ def muon_step_ls2_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
 
     transposed = g.size(-2) <= g.size(-1)
     if transposed:
@@ -653,7 +780,7 @@ def muon_step_gso_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -674,7 +801,7 @@ def muon_step_gso_fused(
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
-    X = _maybe_normalize_muon_orthogonalization_input(X, muon_norm_iters)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
 
     transposed = g.size(-2) <= g.size(-1)
     if transposed:
@@ -706,7 +833,7 @@ def muon_step_adaptive_greedy_fused(
     beta2_t: Tensor,
     ns_steps: int,
     red_dim: int,
-    muon_norm_iters: bool,
+    normalization_code: int,
     ortho_order: int,
     ortho_grid: int,
     ortho_newton: int,
@@ -728,12 +855,54 @@ def muon_step_adaptive_greedy_fused(
         beta2_t,
         ns_steps,
         red_dim,
-        muon_norm_iters,
+        normalization_code,
         ortho_order,
         ortho_grid,
         ortho_newton,
         ortho_dtype_code,
     )
+
+
+def muon_step_uagq_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+    normalization_code: int,
+    ortho_order: int,
+    ortho_grid: int,
+    ortho_newton: int,
+    ortho_dtype_code: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> UAGQ unanchored Gram quintic
+    -> variance_reduction -> cautious_update.
+    """
+
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    X = _cast_muon_orthogonalization_input(g, ortho_dtype_code)
+    X = _maybe_normalize_muon_orthogonalization_input(X, normalization_code)
+
+    transposed = g.size(-2) <= g.size(-1)
+    if transposed:
+        X = X.mT
+
+    for _ in range(ns_steps):
+        X = _uagq_error_step(X, ortho_grid, ortho_newton)
+
+    if transposed:
+        X = X.mT
+
+    _finish_muon_step(X, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim)
 
 
 def _get_muon_step_fn(group: dict):
@@ -752,6 +921,8 @@ def _get_muon_step_fn(group: dict):
         return muon_step_gso_fused
     if orthogonalization == "muon_adhoc":
         return muon_step_adhoc_fused
+    if orthogonalization == "uagq":
+        return muon_step_uagq_fused
     raise ValueError(f"Unknown Muon orthogonalization method: {orthogonalization}")
 
 
@@ -771,6 +942,7 @@ if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") != "1":
     muon_step_adaptive_poly_fused = torch.compile(muon_step_adaptive_poly_fused, dynamic=False, fullgraph=True)
     muon_step_ls2_fused = torch.compile(muon_step_ls2_fused, dynamic=False, fullgraph=True)
     muon_step_gso_fused = torch.compile(muon_step_gso_fused, dynamic=False, fullgraph=True)
+    muon_step_uagq_fused = torch.compile(muon_step_uagq_fused, dynamic=False, fullgraph=True)
 
 
 # -----------------------------------------------------------------------------
@@ -787,7 +959,7 @@ class MuonAdamW(torch.optim.Optimizer):
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'orthogonalization',
-              'muon_norm_iters', 'ortho_order', 'ortho_grid', 'ortho_newton',
+              'muon_norm_iters', 'muon_normalization', 'ortho_order', 'ortho_grid', 'ortho_newton',
               'orthogonalization_dtype', 'beta2', 'weight_decay'. adaptive_poly
               uses error-basis FO/SO depending on ortho_order; gso uses
               previous-gamma second-order error-basis APO; ls2 uses a
@@ -896,7 +1068,7 @@ class MuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t,
             group["ns_steps"],
             red_dim,
-            bool(group.get("muon_norm_iters", True)),
+            _get_muon_normalization_code(group),
             group.get("ortho_order", 1),
             group.get("ortho_grid", 17),
             group.get("ortho_newton", 2),
@@ -1092,7 +1264,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._muon_beta2_t,
                 group["ns_steps"],
                 red_dim,
-                bool(group.get("muon_norm_iters", True)),
+                _get_muon_normalization_code(group),
                 group.get("ortho_order", 1),
                 group.get("ortho_grid", 17),
                 group.get("ortho_newton", 2),

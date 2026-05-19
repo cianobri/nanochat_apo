@@ -65,25 +65,50 @@ BASE_ARGS=(
   --sample-every=-1
   --save-every=-1
   --run=dummy
-  --muon-orthogonalization=gso
-  --model-tag=gso
   --ns-steps=5
   --print-every=1
 )
 
+GSO_ARGS=(
+  "${BASE_ARGS[@]}"
+  --muon-orthogonalization=gso
+)
+
+UAGQ_ARGS=(
+  "${BASE_ARGS[@]}"
+  --muon-orthogonalization=uagq
+)
+
 run_method gso_no_norm \
-  "${BASE_ARGS[@]}" \
+  "${GSO_ARGS[@]}" \
   --model-tag=gso_no_norm \
   --muon-norm-iters=0
 
 run_method gso_frob_norm \
-  "${BASE_ARGS[@]}" \
+  "${GSO_ARGS[@]}" \
   --model-tag=gso_frob_norm \
   --muon-norm-iters=1 \
   --muon-normalization=frobenius
 
 run_method gso_opt_norm \
-  "${BASE_ARGS[@]}" \
+  "${GSO_ARGS[@]}" \
   --model-tag=gso_opt_norm \
+  --muon-norm-iters=1 \
+  --muon-normalization=opt
+
+run_method uagq_no_norm \
+  "${UAGQ_ARGS[@]}" \
+  --model-tag=uagq_no_norm \
+  --muon-norm-iters=0
+
+run_method uagq_frob_norm \
+  "${UAGQ_ARGS[@]}" \
+  --model-tag=uagq_frob_norm \
+  --muon-norm-iters=1 \
+  --muon-normalization=frobenius
+
+run_method uagq_opt_norm \
+  "${UAGQ_ARGS[@]}" \
+  --model-tag=uagq_opt_norm \
   --muon-norm-iters=1 \
   --muon-normalization=opt

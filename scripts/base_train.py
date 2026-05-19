@@ -42,6 +42,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 parser.add_argument("--print-every", type=int, default=100, help="print training progress every N steps")
+parser.add_argument("--verbose-log", action="store_true", help="append extra training diagnostics to the progress log")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -66,8 +67,9 @@ parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious w
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--optimizer", type=str, default="adamw_muon", choices=["adamw", "adamw_muon"], help="optimizer to use: AdamW only, or AdamW for non-matrix params plus Muon for matrix params")
 parser.add_argument("--ns-steps", "--ns_steps", type=int, default=5, help="number of Newton-Schulz/Polar Express iterations for Muon")
-parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly", "ls2", "gso", "adaptive_greedy", "muon_adhoc"], help="orthogonalization method for Muon updates")
+parser.add_argument("--muon-orthogonalization", "--muon_orthogonalization", type=str, default="polar_express", choices=["polar_express", "newton_schulz", "adaptive_poly", "ls2", "gso", "adaptive_greedy", "muon_adhoc", "uagq"], help="orthogonalization method for Muon updates")
 parser.add_argument("--muon-norm-iters", "--muon_norm_iters", type=int, default=1, choices=[0, 1], help="whether Muon normalizes updates before orthogonalization (1=normalize, 0=skip)")
+parser.add_argument("--muon-normalization", "--muon_normalization", type=str, default="frobenius", choices=["frobenius", "opt"], help="Muon normalization strategy when --muon-norm-iters=1: frobenius or opt")
 parser.add_argument("--muon-orthogonalization-dtype", "--muon_orthogonalization_dtype", type=str, default="float32", choices=["param", "float32", "bfloat16", "float16"], help="dtype used inside Muon orthogonalization")
 parser.add_argument("--ortho-order", "--ortho_order", type=int, default=1, choices=[1, 2], help="polynomial order for adaptive_poly Muon orthogonalization")
 parser.add_argument("--ortho-grid", "--ortho_grid", type=int, default=17, help="grid points for adaptive_poly beta solve")
@@ -334,6 +336,7 @@ optimizer = model.setup_optimizer(
     ns_steps=args.ns_steps,
     muon_orthogonalization=args.muon_orthogonalization,
     muon_norm_iters=args.muon_norm_iters,
+    muon_normalization=args.muon_normalization,
     muon_orthogonalization_dtype=args.muon_orthogonalization_dtype,
     ortho_order=args.ortho_order,
     ortho_grid=args.ortho_grid,
@@ -438,6 +441,74 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+def _format_log_value(value):
+    if isinstance(value, bool):
+        return str(int(value))
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        value_abs = abs(value)
+        if value_abs != 0 and (value_abs < 1e-3 or value_abs >= 1e4):
+            return f"{value:.3e}"
+        return f"{value:.6g}"
+    return str(value)
+
+def _append_log_extra(line, log_extra):
+    if not args.verbose_log or not log_extra:
+        return line
+    field_order = (
+        "lr", "grad_norm", "update_norm", "update_to_weight", "update_to_grad",
+        "beta", "gamma", "ortho_before", "ortho_after", "ortho_gain",
+        "lambda_min", "lambda_max", "poly_amp", "optim_ms", "fwd_bwd_ms",
+        "finite", "grad_clip_scale", "loss_scale",
+    )
+    ordered_keys = [key for key in field_order if key in log_extra]
+    ordered_keys.extend(key for key in log_extra if key not in field_order)
+    extra = " | ".join(f"{key}: {_format_log_value(log_extra[key])}" for key in ordered_keys)
+    return f"{line} | {extra}"
+
+@torch.no_grad()
+def _grad_norm_and_finite(parameters):
+    norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+    finite = torch.ones((), device=device, dtype=torch.int32)
+    for p in parameters:
+        if p.grad is None:
+            continue
+        grad = p.grad.detach()
+        norm_sq += grad.float().square().sum()
+        finite = finite & torch.isfinite(grad).all().to(torch.int32)
+    if is_ddp_initialized():
+        dist.all_reduce(norm_sq, op=dist.ReduceOp.SUM)
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    return norm_sq.sqrt().item(), bool(finite.item())
+
+@torch.no_grad()
+def _snapshot_params_for_update_norm(parameters):
+    snapshots = []
+    weight_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+    for p in parameters:
+        if p.grad is None:
+            continue
+        p_detached = p.detach()
+        snapshots.append((p, p_detached.clone()))
+        weight_norm_sq += p_detached.float().square().sum()
+    return snapshots, weight_norm_sq
+
+@torch.no_grad()
+def _update_norms_and_finite(snapshots):
+    update_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+    finite = torch.ones((), device=device, dtype=torch.int32)
+    for p, before in snapshots:
+        update = p.detach() - before
+        update_f = update.float()
+        update_norm_sq += update_f.square().sum()
+        finite = finite & torch.isfinite(update).all().to(torch.int32)
+    return update_norm_sq, bool(finite.item())
+
+def _current_lr(optimizer):
+    lrs = [group["lr"] for group in optimizer.param_groups if "lr" in group]
+    return max(lrs) if lrs else None
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -533,6 +604,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    log_extra = {}
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -542,6 +614,12 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+
+    if args.verbose_log:
+        synchronize()
+        t_fwd_bwd_done = time.time()
+        log_extra["fwd_bwd_ms"] = (t_fwd_bwd_done - t0) * 1000
+
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -551,8 +629,28 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+
+    if args.verbose_log:
+        lr = _current_lr(optimizer)
+        if lr is not None:
+            log_extra["lr"] = lr
+        if scaler is not None:
+            log_extra["loss_scale"] = scaler.get_scale()
+
+    snapshots = []
+    weight_norm_sq = None
+    grad_norm = None
+    finite = True
+    if args.verbose_log:
+        snapshots, weight_norm_sq = _snapshot_params_for_update_norm(orig_model.parameters())
+
+    optim_t0 = time.time() if args.verbose_log else None
     if scaler is not None:
         scaler.unscale_(optimizer)
+        if args.verbose_log:
+            grad_norm, grads_finite = _grad_norm_and_finite(orig_model.parameters())
+            finite = finite and grads_finite
+            log_extra["grad_norm"] = grad_norm
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
@@ -562,9 +660,30 @@ while True:
         scaler.step(optimizer)
         scaler.update()
     else:
+        if args.verbose_log:
+            grad_norm, grads_finite = _grad_norm_and_finite(orig_model.parameters())
+            finite = finite and grads_finite
+            log_extra["grad_norm"] = grad_norm
         optimizer.step()
+
+    if args.verbose_log:
+        synchronize()
+        log_extra["optim_ms"] = (time.time() - optim_t0) * 1000
+        update_norm_sq, updates_finite = _update_norms_and_finite(snapshots)
+        finite = finite and updates_finite
+        update_norm = update_norm_sq.sqrt().item()
+        log_extra["update_norm"] = update_norm
+        weight_norm = weight_norm_sq.sqrt().item() if weight_norm_sq is not None else 0.0
+        if weight_norm > 0:
+            log_extra["update_to_weight"] = update_norm / weight_norm
+        if grad_norm is not None and grad_norm > 0:
+            log_extra["update_to_grad"] = update_norm / grad_norm
+
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if args.verbose_log:
+        finite = finite and math.isfinite(train_loss_f)
+        log_extra["finite"] = int(finite)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -591,7 +710,8 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     if step % args.print_every == 0 or last_step:
-        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+        log_line = f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}"
+        print0(_append_log_extra(log_line, log_extra))
     if step % args.print_every == 0:
         log_data = {
             "step": step,
@@ -604,6 +724,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if args.verbose_log:
+            log_data.update({f"train/{key}": value for key, value in log_extra.items()})
         wandb_run.log(log_data)
 
     # state update

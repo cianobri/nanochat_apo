@@ -84,6 +84,13 @@ for LR in "${LRS[@]}"; do
     --muon-norm-iters=1 \
     --matrix-lr="${LR}"
 
+  run_method "uagq_lr${LR_TAG}" \
+    "${BASE_ARGS[@]}" \
+    --muon-orthogonalization=uagq \
+    --model-tag="uagq_lr${LR_TAG}" \
+    --muon-norm-iters=1 \
+    --matrix-lr="${LR}"
+
   run_method "muon_adhoc_lr${LR_TAG}" \
     "${BASE_ARGS[@]}" \
     --muon-orthogonalization=muon_adhoc \

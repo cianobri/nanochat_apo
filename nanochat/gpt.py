@@ -371,13 +371,15 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express", muon_norm_iters=1, muon_orthogonalization_dtype="float32", ortho_order=1, ortho_grid=17, ortho_newton=2, optimizer="adamw_muon"):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, ns_steps=5, muon_orthogonalization="polar_express", muon_norm_iters=1, muon_normalization="frobenius", muon_orthogonalization_dtype="float32", ortho_order=1, ortho_grid=17, ortho_newton=2, optimizer="adamw_muon"):
         if optimizer not in {"adamw", "adamw_muon"}:
             raise ValueError(f"Unknown optimizer: {optimizer}")
-        if muon_orthogonalization not in {"polar_express", "newton_schulz", "adaptive_poly", "ls2", "gso", "adaptive_greedy", "muon_adhoc"}:
+        if muon_orthogonalization not in {"polar_express", "newton_schulz", "adaptive_poly", "ls2", "gso", "adaptive_greedy", "muon_adhoc", "uagq"}:
             raise ValueError(f"Unknown Muon orthogonalization method: {muon_orthogonalization}")
         if muon_norm_iters not in {0, 1, False, True}:
             raise ValueError("muon_norm_iters must be 0 or 1")
+        if muon_normalization not in {"frobenius", "opt"}:
+            raise ValueError("muon_normalization must be 'frobenius' or 'opt'")
         if muon_orthogonalization_dtype not in {"param", "float32", "bfloat16", "float16"}:
             raise ValueError(f"Unknown Muon orthogonalization dtype: {muon_orthogonalization_dtype}")
         if ortho_order not in {1, 2}:
@@ -429,6 +431,7 @@ class GPT(nn.Module):
                     kind='muon', params=group_params, lr=matrix_lr,
                     momentum=0.95, ns_steps=ns_steps, orthogonalization=muon_orthogonalization,
                     muon_norm_iters=bool(muon_norm_iters),
+                    muon_normalization=muon_normalization,
                     orthogonalization_dtype=muon_orthogonalization_dtype,
                     ortho_order=ortho_order, ortho_grid=ortho_grid, ortho_newton=ortho_newton,
                     beta2=0.9, weight_decay=weight_decay,
