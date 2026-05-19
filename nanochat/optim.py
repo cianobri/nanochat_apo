@@ -519,6 +519,102 @@ def _unanchored_gram_objective_from_coeffs(coeffs: list[Tensor], moments: list[T
     return numerator / denominator.clamp_min(1e-30).square()
 
 
+def _eval_polynomial(coeffs: list[Tensor], theta: Tensor) -> Tensor:
+    value = torch.zeros_like(theta)
+    for coeff in reversed(coeffs):
+        value = value * theta + coeff
+    return value
+
+
+def _eval_polynomial_derivative(coeffs: list[Tensor], theta: Tensor) -> Tensor:
+    value = torch.zeros_like(theta)
+    for k in range(len(coeffs) - 1, 0, -1):
+        value = value * theta + k * coeffs[k]
+    return value
+
+
+def _eval_polynomial_second_derivative(coeffs: list[Tensor], theta: Tensor) -> Tensor:
+    value = torch.zeros_like(theta)
+    for k in range(len(coeffs) - 1, 1, -1):
+        value = value * theta + k * (k - 1) * coeffs[k]
+    return value
+
+
+def _eval_unanchored_rational_objective(
+    s1_coeffs: list[Tensor],
+    s2_coeffs: list[Tensor],
+    theta: Tensor,
+) -> Tensor:
+    s1 = _eval_polynomial(s1_coeffs, theta)
+    s2 = _eval_polynomial(s2_coeffs, theta)
+    finite = torch.isfinite(s1) & torch.isfinite(s2)
+    safe = finite & (s1 > 1e-30)
+    value = s2 / s1.clamp_min(1e-30).square()
+    return torch.where(safe & torch.isfinite(value), value, torch.full_like(value, float("inf")))
+
+
+def _unanchored_rational_minimizer_on_interval(
+    s1_coeffs: list[Tensor],
+    s2_coeffs: list[Tensor],
+    current: Tensor,
+    lo: float,
+    hi: float,
+    n_grid: int,
+    n_newton: int,
+) -> Tensor:
+    """
+    Minimize J(theta) = S2(theta) / S1(theta)^2 over [lo, hi].
+
+    S1 and S2 are low-degree polynomials in the selected coordinate. We first
+    pick the best grid point, then run safeguarded Newton refinement on the
+    rational objective inside the local grid bracket.
+    """
+    delta = (hi - lo) / float(n_grid - 1)
+
+    theta0 = torch.full_like(current, lo)
+    best_value = _eval_unanchored_rational_objective(s1_coeffs, s2_coeffs, theta0)
+    for i in range(1, n_grid):
+        candidate = torch.full_like(current, lo + delta * i)
+        value = _eval_unanchored_rational_objective(s1_coeffs, s2_coeffs, candidate)
+        take_candidate = value < best_value
+        theta0 = torch.where(take_candidate, candidate, theta0)
+        best_value = torch.where(take_candidate, value, best_value)
+
+    left = (theta0 - delta).clamp_min(lo)
+    right = (theta0 + delta).clamp_max(hi)
+    theta = theta0.clamp(left, right)
+
+    eps = 32.0 * torch.finfo(theta.dtype).eps
+    for _ in range(n_newton):
+        s1 = _eval_polynomial(s1_coeffs, theta)
+        s1p = _eval_polynomial_derivative(s1_coeffs, theta)
+        s1pp = _eval_polynomial_second_derivative(s1_coeffs, theta)
+        s2 = _eval_polynomial(s2_coeffs, theta)
+        s2p = _eval_polynomial_derivative(s2_coeffs, theta)
+        s2pp = _eval_polynomial_second_derivative(s2_coeffs, theta)
+
+        a = s2p * s1 - 2.0 * s2 * s1p
+        ap = s2pp * s1 - s2p * s1p - 2.0 * s2 * s1pp
+        jp = a / s1.clamp_min(1e-30).pow(3)
+        jpp = (ap * s1 - 3.0 * a * s1p) / s1.clamp_min(1e-30).pow(4)
+
+        safe = (s1 > 1e-30) & torch.isfinite(jp) & torch.isfinite(jpp) & (jpp.abs() > eps)
+        denom = torch.where(safe, jpp, torch.ones_like(jpp))
+        theta_new = (theta - jp / denom).clamp(left, right)
+        theta = torch.where(safe, theta_new, theta)
+
+    theta_value = _eval_unanchored_rational_objective(s1_coeffs, s2_coeffs, theta)
+    left_value = _eval_unanchored_rational_objective(s1_coeffs, s2_coeffs, left)
+    right_value = _eval_unanchored_rational_objective(s1_coeffs, s2_coeffs, right)
+
+    best = torch.where(left_value < theta_value, left, theta)
+    best_value = torch.minimum(left_value, theta_value)
+    take_right = right_value < best_value
+    best = torch.where(take_right, right, best)
+    best_value = torch.where(take_right, right_value, best_value)
+    return torch.where(torch.isfinite(best_value), best, current)
+
+
 def _optimal_unanchored_gram_coordinate_from_error_moments(
     moments: list[Tensor],
     alpha: Tensor,
@@ -532,25 +628,48 @@ def _optimal_unanchored_gram_coordinate_from_error_moments(
     """
     Bounded coordinate minimizer for the unanchored Gram objective.
 
-    The NumPy prototype uses exact roots of the rational objective's stationary
-    polynomial. This Torch path uses a fixed grid so it stays simple, batched,
-    device-native, and friendly to torch.compile.
+    UAGQ fixes alpha=1 as a scale gauge and optimizes beta/gamma with the same
+    bounds as GSO. The scalar objective is rational, so this uses grid search
+    plus safeguarded Newton refinement instead of the quartic APO minimizer.
     """
     coeffs = [alpha, beta, gamma]
-    best = coeffs[index]
-    best_value = _unanchored_gram_objective_from_coeffs(coeffs, moments)
+    base = [coeffs[0], coeffs[1], coeffs[2]]
+    base[index] = torch.zeros_like(coeffs[index])
+    direction = [torch.zeros_like(coeffs[0]), torch.zeros_like(coeffs[0]), torch.zeros_like(coeffs[0])]
+    direction[index] = torch.ones_like(coeffs[index])
 
-    delta = (coeff_max - coeff_min) / float(ortho_grid - 1)
-    for i in range(ortho_grid):
-        candidate = torch.full_like(best, coeff_min + delta * i)
-        trial_coeffs = [alpha, beta, gamma]
-        trial_coeffs[index] = candidate
-        value = _unanchored_gram_objective_from_coeffs(trial_coeffs, moments)
-        take_candidate = value < best_value
-        best = torch.where(take_candidate, candidate, best)
-        best_value = torch.where(take_candidate, value, best_value)
+    lambda1 = [torch.ones_like(coeffs[0]), -torch.ones_like(coeffs[0])]
+    lambda2 = [torch.ones_like(coeffs[0]), -2.0 * torch.ones_like(coeffs[0]), torch.ones_like(coeffs[0])]
 
-    return best
+    base2 = _poly_convolve(base, base)
+    base_direction = _poly_convolve(base, direction)
+    direction2 = _poly_convolve(direction, direction)
+
+    s1_coeffs = [
+        _moment_polynomial_expectation(_poly_convolve(lambda1, base2), moments),
+        _moment_polynomial_expectation(_poly_convolve(lambda1, [2.0 * c for c in base_direction]), moments),
+        _moment_polynomial_expectation(_poly_convolve(lambda1, direction2), moments),
+    ]
+
+    s2_coeffs: list[Tensor] = []
+    binom4 = (1.0, 4.0, 6.0, 4.0, 1.0)
+    for theta_power, scale in enumerate(binom4):
+        term = [torch.ones_like(coeffs[0])]
+        for _ in range(4 - theta_power):
+            term = _poly_convolve(term, base)
+        for _ in range(theta_power):
+            term = _poly_convolve(term, direction)
+        s2_coeffs.append(_moment_polynomial_expectation(_poly_convolve(lambda2, [scale * c for c in term]), moments))
+
+    return _unanchored_rational_minimizer_on_interval(
+        s1_coeffs,
+        s2_coeffs,
+        coeffs[index],
+        coeff_min,
+        coeff_max,
+        ortho_grid,
+        ortho_newton,
+    )
 
 
 def _uagq_error_step(
@@ -562,8 +681,11 @@ def _uagq_error_step(
     Unanchored Gram quintic update:
         X_next = X @ (I + beta E + gamma E^2)
 
-    This minimizes corrected Gram spectral spread up to scale, with alpha fixed
-    to 1 as the gauge. `ortho_newton` controls beta/gamma coordinate sweeps.
+    UAGQ minimizes a scale-invariant Gram-spectrum flattening objective. Alpha
+    is fixed to 1 as the gauge, beta/gamma use the same bounds as GSO, and each
+    coordinate uses grid plus safeguarded Newton refinement for the rational
+    unanchored objective. UAGQ does not enforce sign preservation of p(e), so
+    the metric is Gram-flatness rather than polar-factor alignment.
     """
     g = x.mT @ x
     eye = torch.eye(g.size(-1), dtype=g.dtype, device=g.device)
@@ -574,14 +696,12 @@ def _uagq_error_step(
     beta = torch.full(x.shape[:-2], 0.5, dtype=x.dtype, device=x.device)
     gamma = torch.full(x.shape[:-2], 0.375, dtype=x.dtype, device=x.device)
 
-    num_sweeps = max(1, ortho_newton)
-    for _ in range(num_sweeps):
-        beta = _optimal_unanchored_gram_coordinate_from_error_moments(
-            moments, alpha, beta, gamma, 1, -2.0, 2.0, ortho_grid,
-        )
-        gamma = _optimal_unanchored_gram_coordinate_from_error_moments(
-            moments, alpha, beta, gamma, 2, -2.0, 2.0, ortho_grid,
-        )
+    beta = _optimal_unanchored_gram_coordinate_from_error_moments(
+        moments, alpha, beta, gamma, 1, 0.0, 1.0, ortho_grid, ortho_newton,
+    )
+    gamma = _optimal_unanchored_gram_coordinate_from_error_moments(
+        moments, alpha, beta, gamma, 2, 0.0, 0.8, ortho_grid, ortho_newton,
+    )
 
     e2 = e @ e
     return x @ (eye + beta[..., None, None] * e + gamma[..., None, None] * e2)
